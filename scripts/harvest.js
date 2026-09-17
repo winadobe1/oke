@@ -3,7 +3,7 @@
  * 
  * Flow:
  * 1. Discover active NetMirror domain via bootstrap pool (check.php).
- * 2. Launch headless browser (Puppeteer) with mobile viewport & user agent.
+ * 2. Launch headless browser (Puppeteer) with Indonesian Residential Proxy.
  * 3. Open /mobile/home?app=1 and trigger ad verification.
  * 4. Wait for background verification to reach "All Done" (~25-35s).
  * 5. Extract verified cookies (t_hash_t + addhash).
@@ -14,6 +14,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { spawnSync } = require('child_process');
 
 // Try loading environment variables if .env exists
 function loadEnv() {
@@ -45,6 +46,27 @@ loadEnv();
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 const IS_TEST_ONLY = process.argv.includes('--test-only');
+
+// Konfigurasi Residential Proxy (Default: Rainproxy Residential Jakarta, Indonesia)
+const RAW_PROXY = process.env.PROXY_SERVER || process.env.RESIDENTIAL_PROXY || 'http://uy9rgc3e3tb-country-ID-state-jakarta_raya-city-jakarta-session-bpu5qzx6:p7c3vz7ey9tz@resi-bridge-us.rainproxy.io:3333';
+
+let proxyHost = null;
+let proxyAuth = null;
+
+if (RAW_PROXY) {
+  try {
+    const pUrl = new URL(RAW_PROXY);
+    proxyHost = `${pUrl.protocol}//${pUrl.host}`;
+    if (pUrl.username && pUrl.password) {
+      proxyAuth = {
+        username: decodeURIComponent(pUrl.username),
+        password: decodeURIComponent(pUrl.password),
+      };
+    }
+  } catch (e) {
+    proxyHost = RAW_PROXY;
+  }
+}
 
 const HOST_POOL_B64 = [
   'aHR0cHM6Ly9tb2JpbGVkZXRlY3RzLmNvbQ==', 'aHR0cHM6Ly9tb2JpbGVkZXRlY3QuYXBw',
@@ -146,6 +168,12 @@ async function harvestSession(origin) {
       '--blink-settings=imagesEnabled=true',
     ],
   };
+
+  if (proxyHost) {
+    console.log(`   -> 🌐 Menggunakan Residential Proxy: ${proxyHost} (Targeting: Indonesia/Jakarta)`);
+    launchOpts.args.push(`--proxy-server=${proxyHost}`);
+  }
+
   if (chromePath) {
     launchOpts.executablePath = chromePath;
   }
@@ -155,6 +183,10 @@ async function harvestSession(origin) {
 
   try {
     const page = await browser.newPage();
+    if (proxyAuth) {
+      await page.authenticate(proxyAuth);
+    }
+
     await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true });
     await page.setUserAgent(MOBILE_UA);
 
@@ -169,7 +201,7 @@ async function harvestSession(origin) {
         try {
           const adPage = await target.page();
           if (adPage) {
-            console.log(`   [Tab Iklan Terbuka] -> ${adPage.url().slice(0, 70)}...`);
+            if (proxyAuth) await adPage.authenticate(proxyAuth);
             await adPage.setUserAgent(MOBILE_UA);
           }
         } catch (e) {}
@@ -191,7 +223,7 @@ async function harvestSession(origin) {
     // Tunggu selektor body[data-addhash]
     await page.waitForFunction(() => {
       return document.body && document.body.hasAttribute('data-addhash');
-    }, { timeout: 10000 }).catch(() => {});
+    }, { timeout: 15000 }).catch(() => {});
 
     const initialHash = await page.evaluate(() => {
       return document.body.getAttribute('data-addhash') || null;
@@ -206,7 +238,8 @@ async function harvestSession(origin) {
     console.log(`   -> Status data-addhash: ${initialHash.slice(0, 45)}...`);
     const isDi = initialHash.includes('::di');
     const isSu = initialHash.includes('::su');
-    console.log(`   -> Tipe IP terdeteksi oleh NetMirror: ${isDi ? '✅ RESIDENTIAL/DEVICE (::di)' : isSu ? '⚠️ DATACENTER/SERVER (::su)' : 'UNKNOWN'}`);
+    const isBg = initialHash.includes('::bg');
+    console.log(`   -> Tipe IP terdeteksi oleh NetMirror: ${isDi ? '✅ RESIDENTIAL/DEVICE (::di 🎉)' : isSu ? '⚠️ DATACENTER/SERVER (::su)' : isBg ? '⚠️ PROXY/BOT (::bg)' : 'UNKNOWN'}`);
 
     // Cari dan klik tombol iklan
     const button = await page.$('.open-support, .checker');
@@ -309,27 +342,56 @@ async function harvestSession(origin) {
 async function validateSession(origin, cookies) {
   console.log('\n[4/5] 🔍 Menguji validitas sesi dengan probe katalog (search.php)...');
   const cookieHeader = `t_hash_t=${cookies.t_hash_t}; addhash=${cookies.addhash || ''}; ott=nf; hd=on`;
-
   const probeUrl = `${origin}/mobile/search.php?s=Avatar&tm=${Math.floor(Date.now() / 1000)}`;
-  const res = await fetch(probeUrl, {
-    headers: {
-      'User-Agent': MOBILE_UA,
-      'Cookie': cookieHeader,
-      'Referer': `${origin}/mobile/`,
-    },
-  });
 
-  const data = await res.json().catch(() => null);
+  let data = null;
+
+  // Jika proxy aktif, gunakan curl untuk memastikan request melalui residential proxy dan bypass TLS
+  if (RAW_PROXY) {
+    try {
+      const curlBin = process.platform === 'win32' ? 'curl.exe' : 'curl';
+      const args = [
+        '-sL',
+        '--max-time', '15',
+        probeUrl,
+        '-x', RAW_PROXY,
+        '-H', `User-Agent: ${MOBILE_UA}`,
+        '-H', `Cookie: ${cookieHeader}`,
+        '-H', `Referer: ${origin}/mobile/`,
+        '--compressed'
+      ];
+      const res = spawnSync(curlBin, args, { encoding: 'utf-8' });
+      if (res.stdout) {
+        data = JSON.parse(res.stdout);
+      }
+    } catch (e) {}
+  }
+
+  // Fallback ke native fetch jika curl tidak mengembalikan data
+  if (!data) {
+    const res = await fetch(probeUrl, {
+      headers: {
+        'User-Agent': MOBILE_UA,
+        'Cookie': cookieHeader,
+        'Referer': `${origin}/mobile/`,
+      },
+    });
+    data = await res.json().catch(() => null);
+  }
+
   const status = data?.status;
   const isTopSearch = /top\s+search/i.test(data?.head || '');
-  const count = data?.searchResult?.length || 0;
+  const count = data?.searchResult?.length || data?.search?.length || 0;
 
   console.log(`   -> Status respons: ${status} (Hasil: ${count} judul)`);
+  if (data?.head) console.log(`   -> Header katalog: "${data.head}"`);
+
   if (status !== 'y' || isTopSearch) {
     throw new Error(`Validasi sesi gagal! Respons search: status="${status}", head="${data?.head}"`);
   }
 
-  console.log(`   -> ✅ Sesi TERBUKTI AKTIF & VALID! Target judul: "${data.searchResult[0]?.t}"`);
+  const title = data.searchResult?.[0]?.t || data.search?.[0]?.t || 'Avatar';
+  console.log(`   -> ✅ Sesi TERBUKTI AKTIF & VALID! Target judul: "${title}"`);
   return true;
 }
 
@@ -346,7 +408,7 @@ function saveTokenJson(origin, session) {
     addhash: session.addhash || '',
     cookie: fullCookie,
     updated_at: new Date().toISOString(),
-    expires_at: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
+    expires_at: new Date(Date.now() + 10 * 60 * 60 * 1000).toISOString(),
   };
 
   fs.writeFileSync(tokenFilePath, JSON.stringify(data, null, 2), 'utf8');
@@ -360,7 +422,7 @@ async function syncToRedisIfAvailable(sessionCookieString) {
   console.log('   -> 🔄 Melakukan sinkronisasi opsional ke Upstash Redis...');
   const cleanUrl = REDIS_URL.replace(/\/+$/, '');
   const ottModes = ['nf', 'pv', 'hs'];
-  const ttlSeconds = 7200;
+  const ttlSeconds = 36000; // 10 jam (sesuai interval cron 10 jam)
 
   for (const ott of ottModes) {
     const redisKey = `wins:nm-mobile:web-session:v1:${ott}`;
