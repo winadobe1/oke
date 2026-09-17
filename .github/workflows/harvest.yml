@@ -1,0 +1,39 @@
+name: 🔄 Auto Harvest NetMirror Token
+
+on:
+  schedule:
+    # Berjalan otomatis setiap 2 jam
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+
+jobs:
+  harvest-token:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: 📦 Install dependencies
+        run: npm install
+
+      - name: ⛏️ Jalankan Headless Session Harvester
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: node scripts/harvest.js
+
+      - name: 📤 Auto-Commit & Push token.json ke Repository
+        run: |
+          git config user.name "NetMirror-Bot"
+          git config user.email "bot@github.actions"
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          git add token.json
+          git diff --staged --quiet && echo "Tidak ada perubahan pada token.json" || (git commit -m "🔄 Update NetMirror Token $(date -u +'%Y-%m-%d %H:%M UTC')" && git pull --rebase && git push)
