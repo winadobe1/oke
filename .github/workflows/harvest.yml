@@ -23,12 +23,6 @@ jobs:
 
       - name: 📦 Install dependencies
         run: npm install
-
-      - name: 🌐 Hubungkan Cloudflare WARP (Consumer IP Network)
-        uses: fscarmen/warp-on-actions@v1.3
-        with:
-          mode: client
-
       - name: 🔎 Cek Status IP Koneksi & NetMirror
         run: |
           curl -s https://cloudflare.com/cdn-cgi/trace || true
