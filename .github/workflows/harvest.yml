@@ -41,3 +41,9 @@ jobs:
           git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
           git add token.json
           git diff --staged --quiet && echo "Tidak ada perubahan pada token.json" || (git commit -m "🔄 Update NetMirror Token $(date -u +'%Y-%m-%d %H:%M UTC')" && git pull --rebase && git push)
+
+      - name: 🔄 Purge jsDelivr CDN Cache
+        run: |
+          echo "Memperbarui cache CDN jsDelivr..."
+          curl -s "https://purge.jsdelivr.net/gh/${{ github.repository }}@main/token.json" || true
+
