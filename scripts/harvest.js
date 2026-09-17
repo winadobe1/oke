@@ -97,6 +97,13 @@ function resolvePuppeteer() {
     try {
       return require('puppeteer-core');
     } catch (e2) {
+      const scratchPuppeteer = path.join(
+        process.env.USERPROFILE || 'C:\\Users\\erwin',
+        '.gemini\\antigravity-ide\\brain\\7e30b8c0-52bc-4955-b16b-d07439b5aa54\\scratch\\node_modules\\puppeteer-core'
+      );
+      if (fs.existsSync(scratchPuppeteer)) {
+        return require(scratchPuppeteer);
+      }
       throw new Error('Puppeteer tidak ditemukan. Jalankan: npm install');
     }
   }
@@ -109,6 +116,8 @@ function getChromePath() {
   const defaultPaths = [
     'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
     'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
     '/usr/bin/google-chrome',
     '/usr/bin/google-chrome-stable',
     '/usr/bin/chromium-browser',
@@ -132,7 +141,8 @@ async function harvestSession(origin) {
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-web-security',
-      '--disable-features=IsolateOrigins,site-per-process',
+      '--disable-blink-features=AutomationControlled',
+      '--window-size=390,844',
       '--blink-settings=imagesEnabled=true',
     ],
   };
@@ -145,88 +155,152 @@ async function harvestSession(origin) {
 
   try {
     const page = await browser.newPage();
-    await page.setViewport({ width: 412, height: 915, isMobile: true, hasTouch: true });
+    await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true });
     await page.setUserAgent(MOBILE_UA);
+
+    // Mask webdriver
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    });
+
+    // Pantau tab popup iklan yang dibuka via window.open
+    browser.on('targetcreated', async (target) => {
+      if (target.type() === 'page') {
+        try {
+          const adPage = await target.page();
+          if (adPage) {
+            console.log(`   [Tab Iklan Terbuka] -> ${adPage.url().slice(0, 70)}...`);
+            await adPage.setUserAgent(MOBILE_UA);
+          }
+        } catch (e) {}
+      }
+    });
 
     const targetUrl = `${origin}/mobile/home?app=1`;
     console.log(`   -> Membuka: ${targetUrl}`);
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 35000 });
+    const response = await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 35000 }).catch(async (err) => {
+      console.log(`   ⚠️ Peringatan saat navigasi (${err.message}), mencoba lanjut...`);
+      return null;
+    });
 
-    await new Promise(r => setTimeout(r, 2000));
+    const pageTitle = await page.title().catch(() => '');
+    const currentUrl = page.url();
+    const httpStatus = response ? response.status() : 'unknown';
+    console.log(`   -> Judul Halaman: "${pageTitle}" | URL: ${currentUrl} | HTTP Status: ${httpStatus}`);
+
+    // Tunggu selektor body[data-addhash]
+    await page.waitForFunction(() => {
+      return document.body && document.body.hasAttribute('data-addhash');
+    }, { timeout: 10000 }).catch(() => {});
 
     const initialHash = await page.evaluate(() => {
       return document.body.getAttribute('data-addhash') || null;
     });
-    console.log(`   -> Status hash awal: ${initialHash ? initialHash.slice(0, 45) + '...' : 'none'}`);
 
-    const buttonExists = await page.evaluate(() => {
-      const btn = document.querySelector('.open-support, .checker');
-      return !!btn;
-    });
-
-    if (buttonExists) {
-      console.log('   -> Tombol iklan ditemukan! Memicu klik verifikasi iklan...');
-      await page.evaluate(() => {
-        const btn = document.querySelector('.open-support, .checker');
-        if (btn) btn.click();
-      });
+    if (!initialHash) {
+      const bodySnippet = await page.evaluate(() => document.body?.innerHTML?.slice(0, 300) || 'empty');
+      console.log(`   ⚠️ data-addhash tidak ditemukan! Snippet body: ${bodySnippet.replace(/\s+/g, ' ')}`);
+      throw new Error(`Gagal membaca data-addhash. Kemungkinan Cloudflare Challenge ("${pageTitle}") atau halaman berubah.`);
     }
 
-    console.log('\n[3/5] ⏳ Menunggu callback verifikasi dari server NetMirror...');
-    const startTime = Date.now();
-    const maxWaitMs = 50000;
-    let isDone = false;
+    console.log(`   -> Status data-addhash: ${initialHash.slice(0, 45)}...`);
+    const isDi = initialHash.includes('::di');
+    const isSu = initialHash.includes('::su');
+    console.log(`   -> Tipe IP terdeteksi oleh NetMirror: ${isDi ? '✅ RESIDENTIAL/DEVICE (::di)' : isSu ? '⚠️ DATACENTER/SERVER (::su)' : 'UNKNOWN'}`);
 
-    while (Date.now() - startTime < maxWaitMs) {
-      const elapsed = Math.round((Date.now() - startTime) / 1000);
-      const cookies = await page.cookies();
-      const thashCookie = cookies.find(c => c.name === 't_hash_t' || c.name === 't_hash');
-      const addhashCookie = cookies.find(c => c.name === 'addhash');
+    // Cari dan klik tombol iklan
+    const button = await page.$('.open-support, .checker');
+    if (!button) {
+      throw new Error('Tombol verifikasi iklan (.open-support / .checker) tidak ditemukan di halaman.');
+    }
 
-      const isVerifiedSig = thashCookie && (
-        thashCookie.value.includes('::di::m') || 
-        thashCookie.value.includes('::m')
-      );
+    console.log('   -> Tombol iklan ditemukan! Memicu klik verifikasi iklan...');
+    await button.click();
+    console.log('   -> Tombol iklan ditekan. Menunggu proses callback verifikasi (~25-35s)...');
 
-      const pageDone = await page.evaluate(() => {
-        const ssss = document.querySelector('.ssss');
-        const overlay = document.querySelector('.info2');
-        const title = document.title;
-        return (title && title.includes('Home')) && (!overlay || window.getComputedStyle(overlay).display === 'none');
-      }).catch(() => false);
+    console.log('\n[3/5] ⏳ Melakukan polling verifikasi ke /mobile/verify2.php...');
+    let isAllDone = false;
+    const maxPollSeconds = 45;
 
-      if (isVerifiedSig || pageDone) {
-        console.log(`   ⏱️ [${elapsed}s] ✅ Verifikasi sukses! Sesi NetMirror terverifikasi!`);
-        verifiedCookies = {
-          t_hash_t: thashCookie?.value,
-          addhash: addhashCookie?.value,
-          allCookies: cookies,
-        };
-        isDone = true;
+    for (let sec = 2; sec <= maxPollSeconds; sec += 2) {
+      await new Promise(r => setTimeout(r, 2000));
+
+      const pollResult = await page.evaluate(async (hash) => {
+        try {
+          const res = await fetch('/mobile/verify2.php', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+              'X-Requested-With': 'XMLHttpRequest',
+            },
+            body: 'verify=' + encodeURIComponent(hash),
+          });
+          return await res.json();
+        } catch (e) {
+          return { error: e.message };
+        }
+      }, initialHash);
+
+      const statusText = pollResult?.statusup || pollResult?.error || JSON.stringify(pollResult);
+      process.stdout.write(`   ⏱️ [${sec}s] Status verifikasi: ${statusText}\r`);
+
+      if (pollResult && pollResult.statusup === 'All Done') {
+        console.log(`\n   ⏱️ [${sec}s] 🎉 VERIFIKASI SUKSES! Status: "All Done"!`);
+        isAllDone = true;
+
+        console.log('   -> Me-reload halaman untuk finalisasi cookie...');
+        await page.reload({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
+
+        console.log('   -> Memanggil p.php untuk sinkronisasi token...');
+        await page.evaluate(async () => {
+          try {
+            await fetch('/mobile/p.php');
+          } catch (e) {}
+        });
         break;
-      } else {
-        process.stdout.write(`   ⏱️ [${elapsed}s] Status: Menunggu verifikasi iklan...\r`);
       }
-      await new Promise(r => setTimeout(r, 2500));
     }
 
-    if (!isDone) {
-      const cookies = await page.cookies();
-      const thashCookie = cookies.find(c => c.name === 't_hash_t' || c.name === 't_hash');
-      const addhashCookie = cookies.find(c => c.name === 'addhash');
-      if (thashCookie) {
-        console.log('\n   ⚠️ Mengambil cookie sesi terakhir...');
-        verifiedCookies = {
-          t_hash_t: thashCookie.value,
-          addhash: addhashCookie?.value,
-          allCookies: cookies,
-        };
-      } else {
-        throw new Error('Timeout: Verifikasi iklan gagal menghasilkan cookie sesi yang valid');
-      }
+    if (!isAllDone) {
+      console.log('\n   ⚠️ Polling tidak mencapai "All Done", mencoba membaca cookie yang tersedia...');
     }
+
+    // Ekstrak semua cookies via CDP session & page.cookies()
+    const client = await page.target().createCDPSession();
+    const allCookiesObj = await client.send('Network.getAllCookies').catch(() => ({ cookies: [] }));
+    const pageCookies = await page.cookies().catch(() => []);
+    const mergedCookies = [...(allCookiesObj.cookies || []), ...pageCookies];
+
+    // Dedup cookies by name
+    const cookieMap = new Map();
+    for (const c of mergedCookies) {
+      if (!cookieMap.has(c.name)) cookieMap.set(c.name, c);
+    }
+    const finalCookies = Array.from(cookieMap.values());
+
+    const tHashTCookie = finalCookies.find(c => c.name === 't_hash_t');
+    const tHashCookie = finalCookies.find(c => c.name === 't_hash');
+    const addHashCookie = finalCookies.find(c => c.name === 'addhash');
+
+    const primaryToken = tHashTCookie?.value || tHashCookie?.value;
+
+    if (!primaryToken) {
+      console.log('   Daftar cookie yang ditemukan:', finalCookies.map(c => c.name).join(', '));
+      throw new Error('Verifikasi gagal: Cookie t_hash_t maupun t_hash tidak ditemukan.');
+    }
+
+    verifiedCookies = {
+      t_hash_t: tHashTCookie?.value || primaryToken,
+      t_hash: tHashCookie?.value || primaryToken,
+      addhash: addHashCookie?.value || initialHash,
+      allCookies: finalCookies,
+    };
+
+    console.log(`   -> Cookie t_hash_t: ${verifiedCookies.t_hash_t.slice(0, 40)}...`);
+    console.log(`   -> Cookie addhash : ${verifiedCookies.addhash.slice(0, 40)}...`);
+
   } finally {
-    await browser.close();
+    await browser.close().catch(() => {});
   }
 
   return verifiedCookies;
