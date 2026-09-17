@@ -29,8 +29,10 @@ jobs:
         with:
           mode: client
 
-      - name: 🔎 Cek Status IP Koneksi
-        run: curl -s https://cloudflare.com/cdn-cgi/trace || true
+      - name: 🔎 Cek Status IP Koneksi & NetMirror
+        run: |
+          curl -s https://cloudflare.com/cdn-cgi/trace || true
+          curl -s -I "https://net52.cc/mobile/home?app=1" || true
 
       - name: ⛏️ Jalankan Headless Session Harvester
         env:
