@@ -1,0 +1,16 @@
+{
+  "name": "netmirror-harvester",
+  "version": "1.0.0",
+  "description": "Automated NetMirror Ad-Verification & Session Harvester for Wins TV",
+  "main": "scripts/harvest.js",
+  "scripts": {
+    "harvest": "node scripts/harvest.js",
+    "test": "node scripts/harvest.js --test-only"
+  },
+  "keywords": ["netmirror", "harvester", "redis", "stream", "wins-tv"],
+  "author": "Wins TV",
+  "license": "ISC",
+  "dependencies": {
+    "puppeteer": "^24.4.0"
+  }
+}
