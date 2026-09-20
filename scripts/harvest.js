@@ -258,38 +258,59 @@ async function harvestSession(origin) {
     for (let sec = 2; sec <= maxPollSeconds; sec += 2) {
       await new Promise(r => setTimeout(r, 2000));
 
-      const pollResult = await page.evaluate(async (hash) => {
-        try {
-          const res = await fetch('/mobile/verify2.php', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-              'X-Requested-With': 'XMLHttpRequest',
-            },
-            body: 'verify=' + encodeURIComponent(hash),
-          });
-          return await res.json();
-        } catch (e) {
-          return { error: e.message };
+      let pollResult = null;
+      let navReloadDetected = false;
+
+      try {
+        pollResult = await page.evaluate(async (hash) => {
+          try {
+            const res = await fetch('/mobile/verify2.php', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'X-Requested-With': 'XMLHttpRequest',
+              },
+              body: 'verify=' + encodeURIComponent(hash),
+            });
+            return await res.json();
+          } catch (e) {
+            return { error: e.message };
+          }
+        }, initialHash);
+      } catch (evalErr) {
+        // Ketika verifikasi sukses, script NetMirror otomatis menjalankan location.reload().
+        // Ini menghancurkan execution context Puppeteer pada milidetik yang sama.
+        if (evalErr.message.includes('Execution context was destroyed') || evalErr.message.includes('navigating')) {
+          console.log(`\n   ℹ️ Terdeteksi auto-reload halaman dari NetMirror (indikasi All Done / verifikasi berhasil).`);
+          navReloadDetected = true;
+          await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
+        } else {
+          console.log(`\n   ⚠️ Polling eval info: ${evalErr.message.split('\n')[0]}`);
         }
-      }, initialHash);
+      }
 
-      const statusText = pollResult?.statusup || pollResult?.error || JSON.stringify(pollResult);
-      process.stdout.write(`   ⏱️ [${sec}s] Status verifikasi: ${statusText}\r`);
+      // Periksa apakah NetMirror sudah memasang cookie sesi t_hash / t_hash_t
+      const checkCookies = await page.cookies().catch(() => []);
+      const hasSessionCookie = checkCookies.some(c => c.name === 't_hash_t' || c.name === 't_hash');
 
-      if (pollResult && pollResult.statusup === 'All Done') {
-        console.log(`\n   ⏱️ [${sec}s] 🎉 VERIFIKASI SUKSES! Status: "All Done"!`);
+      const statusText = pollResult?.statusup || pollResult?.error || (navReloadDetected ? 'Auto-Reloading Page' : 'Waiting response');
+      console.log(`   ⏱️ [${sec}s] Status verifikasi: ${statusText}`);
+
+      if (navReloadDetected || pollResult?.statusup === 'All Done' || hasSessionCookie) {
+        console.log(`\n   ⏱️ [${sec}s] 🎉 VERIFIKASI BERHASIL! (All Done / Auto-Reload / Cookie Sesi Terdeteksi)`);
         isAllDone = true;
 
-        console.log('   -> Me-reload halaman untuk finalisasi cookie...');
-        await page.reload({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
+        if (!navReloadDetected) {
+          console.log('   -> Me-reload halaman untuk finalisasi cookie...');
+          await page.reload({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
+        }
 
         console.log('   -> Memanggil p.php untuk sinkronisasi token...');
         await page.evaluate(async () => {
           try {
             await fetch('/mobile/p.php');
           } catch (e) {}
-        });
+        }).catch(() => {});
         break;
       }
     }
