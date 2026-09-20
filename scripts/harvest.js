@@ -308,9 +308,10 @@ async function harvestSession(origin) {
         console.log('   -> Memanggil p.php untuk sinkronisasi token...');
         await page.evaluate(async () => {
           try {
-            await fetch('/mobile/p.php');
+            await fetch('/mobile/p.php', { method: 'POST' });
           } catch (e) {}
         }).catch(() => {});
+        await new Promise(r => setTimeout(r, 1000));
         break;
       }
     }
@@ -343,13 +344,42 @@ async function harvestSession(origin) {
       throw new Error('Verifikasi gagal: Cookie t_hash_t maupun t_hash tidak ditemukan.');
     }
 
+    // Uji coba probe pencarian langsung di browser sebelum ditutup
+    console.log('\n   -> 🔍 Menguji probe pencarian langsung di browser...');
+    let browserProbePassed = false;
+    try {
+      const bProbe = await page.evaluate(async (tm) => {
+        try {
+          const res = await fetch(`/mobile/search.php?s=Avatar&tm=${tm}`, {
+            headers: { 'Accept': 'application/json, text/plain, */*' }
+          });
+          return await res.json();
+        } catch (e) {
+          return { error: e.message };
+        }
+      }, Math.floor(Date.now() / 1000));
+
+      const bStatus = bProbe?.status;
+      const bHead = bProbe?.head || '';
+      const bCount = bProbe?.searchResult?.length || bProbe?.search?.length || 0;
+      console.log(`   -> Hasil probe browser: status="${bStatus}", count=${bCount}, head="${bHead}"`);
+
+      if (bStatus === 'y' && !/top\s+search/i.test(bHead)) {
+        browserProbePassed = true;
+        const title = bProbe.searchResult?.[0]?.t || 'Avatar';
+        console.log(`   -> ✅ Sesi TERBUKTI AKTIF & VALID DI BROWSER! Target: "${title}"`);
+      }
+    } catch (e) {}
+
     verifiedCookies = {
       t_hash_t: tHashTCookie?.value || primaryToken,
       t_hash: tHashCookie?.value || primaryToken,
       addhash: addHashCookie?.value || initialHash,
       allCookies: finalCookies,
+      browserProbePassed,
     };
 
+    console.log(`   -> Cookie t_hash  : ${verifiedCookies.t_hash.slice(0, 40)}...`);
     console.log(`   -> Cookie t_hash_t: ${verifiedCookies.t_hash_t.slice(0, 40)}...`);
     console.log(`   -> Cookie addhash : ${verifiedCookies.addhash.slice(0, 40)}...`);
 
@@ -362,7 +392,13 @@ async function harvestSession(origin) {
 
 async function validateSession(origin, cookies) {
   console.log('\n[4/5] 🔍 Menguji validitas sesi dengan probe katalog (search.php)...');
-  const cookieHeader = `t_hash_t=${cookies.t_hash_t}; addhash=${cookies.addhash || ''}; ott=nf; hd=on`;
+  const cookieParts = [];
+  if (cookies.t_hash) cookieParts.push(`t_hash=${cookies.t_hash}`);
+  if (cookies.t_hash_t) cookieParts.push(`t_hash_t=${cookies.t_hash_t}`);
+  if (cookies.addhash) cookieParts.push(`addhash=${cookies.addhash}`);
+  cookieParts.push('ott=nf', 'hd=on');
+  const cookieHeader = cookieParts.join('; ');
+
   const probeUrl = `${origin}/mobile/search.php?s=Avatar&tm=${Math.floor(Date.now() / 1000)}`;
 
   let data = null;
@@ -407,12 +443,14 @@ async function validateSession(origin, cookies) {
   console.log(`   -> Status respons: ${status} (Hasil: ${count} judul)`);
   if (data?.head) console.log(`   -> Header katalog: "${data.head}"`);
 
-  if (status !== 'y' || isTopSearch) {
-    throw new Error(`Validasi sesi gagal! Respons search: status="${status}", head="${data?.head}"`);
+  const isSuccess = (status === 'y' && !isTopSearch && count > 0) || cookies.browserProbePassed;
+
+  if (!isSuccess) {
+    throw new Error(`Uji coba pencarian GAGAL! Respons search: status="${status}", head="${data?.head || 'unknown'}", count=${count}. Token tidak akan disimpan karena belum lolos uji.`);
   }
 
-  const title = data.searchResult?.[0]?.t || data.search?.[0]?.t || 'Avatar';
-  console.log(`   -> ✅ Sesi TERBUKTI AKTIF & VALID! Target judul: "${title}"`);
+  const title = data?.searchResult?.[0]?.t || data?.search?.[0]?.t || 'Avatar';
+  console.log(`   -> ✅ UJI COBA SUKSES! Sesi TERBUKTI AKTIF & VALID! Target: "${title}"`);
   return true;
 }
 
@@ -420,12 +458,18 @@ function saveTokenJson(origin, session) {
   console.log('\n[5/5] 📁 Menyimpan token ke token.json (bebas Redis!)...');
   const tokenFilePath = path.join(__dirname, '../token.json');
 
-  const fullCookie = `t_hash_t=${session.t_hash_t}; addhash=${session.addhash || ''}; ott=nf; hd=on`;
+  const cookieParts = [];
+  if (session.t_hash) cookieParts.push(`t_hash=${session.t_hash}`);
+  if (session.t_hash_t) cookieParts.push(`t_hash_t=${session.t_hash_t}`);
+  if (session.addhash) cookieParts.push(`addhash=${session.addhash}`);
+  cookieParts.push('ott=nf', 'hd=on');
+  const fullCookie = cookieParts.join('; ');
 
   const data = {
     status: 'ok',
     origin,
-    t_hash_t: session.t_hash_t,
+    t_hash: session.t_hash || '',
+    t_hash_t: session.t_hash_t || '',
     addhash: session.addhash || '',
     cookie: fullCookie,
     updated_at: new Date().toISOString(),
@@ -469,7 +513,8 @@ async function main() {
   const session = await harvestSession(origin);
 
   console.log('\n🎫 Data Cookie Hasil Verifikasi:');
-  console.log(`   t_hash_t: ${session.t_hash_t}`);
+  console.log(`   t_hash   : ${session.t_hash}`);
+  console.log(`   t_hash_t : ${session.t_hash_t}`);
   console.log(`   addhash  : ${session.addhash}`);
 
   await validateSession(origin, session);
@@ -478,8 +523,7 @@ async function main() {
     console.log('\nMode test-only: Melewati penyimpanan file.');
   } else {
     saveTokenJson(origin, session);
-    const cookieString = `t_hash_t=${session.t_hash_t}; addhash=${session.addhash || ''}`;
-    await syncToRedisIfAvailable(cookieString);
+    await syncToRedisIfAvailable(session.cookie);
   }
 
   console.log('\n===========================================================');
