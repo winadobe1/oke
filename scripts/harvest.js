@@ -151,6 +151,20 @@ function getChromePath() {
   return undefined;
 }
 
+function describeNetMirrorIpMarker(addHash) {
+  // NetMirror versi lama menambahkan marker eksplisit setelah pemisah "::".
+  // Nilai setelah pemisah pada format baru dapat berupa hash opaque, jadi jangan
+  // menebak tipe IP jika marker legacy memang tidak dikirim oleh server.
+  const markerMatch = String(addHash || '').match(/(?:^|::)(di|su|bg)(?=::|$)/i);
+  const marker = markerMatch?.[1]?.toLowerCase();
+
+  if (marker === 'di') return '✅ RESIDENTIAL/DEVICE (marker legacy ::di)';
+  if (marker === 'su') return '⚠️ DATACENTER/SERVER (marker legacy ::su)';
+  if (marker === 'bg') return '⚠️ PROXY/BOT (marker legacy ::bg)';
+
+  return 'ℹ️ FORMAT BARU/OPAQUE (server tidak mengirim marker tipe IP)';
+}
+
 async function harvestSession(origin) {
   console.log('\n[2/5] 🤖 Menjalankan Headless Browser untuk verifikasi iklan...');
   const puppeteer = resolvePuppeteer();
@@ -236,10 +250,7 @@ async function harvestSession(origin) {
     }
 
     console.log(`   -> Status data-addhash: ${initialHash.slice(0, 45)}...`);
-    const isDi = initialHash.includes('::di');
-    const isSu = initialHash.includes('::su');
-    const isBg = initialHash.includes('::bg');
-    console.log(`   -> Tipe IP terdeteksi oleh NetMirror: ${isDi ? '✅ RESIDENTIAL/DEVICE (::di 🎉)' : isSu ? '⚠️ DATACENTER/SERVER (::su)' : isBg ? '⚠️ PROXY/BOT (::bg)' : 'UNKNOWN'}`);
+    console.log(`   -> Format klasifikasi NetMirror: ${describeNetMirrorIpMarker(initialHash)}`);
 
     // Cari dan klik tombol iklan
     const button = await page.$('.open-support, .checker');
