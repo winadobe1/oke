@@ -24,11 +24,6 @@ jobs:
       - name: 📦 Install dependencies
         run: npm install
 
-      - name: 🔎 Cek Status IP Koneksi & NetMirror
-        run: |
-          curl -s https://cloudflare.com/cdn-cgi/trace || true
-          curl -s -I "https://net52.cc/mobile/home?app=1" || true
-
       - name: ⛏️ Jalankan Headless Session Harvester
         env:
           PROXY_SERVER: ${{ secrets.PROXY_SERVER || 'http://uy9rgc3e3tb-country-ID-state-jakarta_raya-city-jakarta-session-bpu5qzx6:p7c3vz7ey9tz@resi-bridge-us.rainproxy.io:3333' }}
