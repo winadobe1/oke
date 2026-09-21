@@ -331,13 +331,13 @@ async function clickVerificationAd(page, browser, proxy) {
   const popupTarget = await popupTargetPromise;
   if (!popupTarget) {
     console.log('   ⚠️ Klik tidak membuat popup baru; melanjutkan karena provider dapat memakai redirect/iframe.');
-    return null;
+    return { page: null, host: null, intermediate: false };
   }
 
   const adPage = await popupTarget.page();
   if (!adPage) {
     console.log('   ⚠️ Target iklan terbuat tetapi halaman popup tidak dapat diakses.');
-    return null;
+    return { page: null, host: null, intermediate: false };
   }
 
   if (proxy.auth) await adPage.authenticate(proxy.auth).catch(() => {});
@@ -362,11 +362,19 @@ async function clickVerificationAd(page, browser, proxy) {
   } catch (e) {}
   console.log(`   -> Popup iklan aktif pada host: ${adHost}`);
 
-  return adPage;
+  const intermediate = /(^|\.)userver\.net52\.cc$/i.test(adHost);
+  if (intermediate) {
+    console.log('   ⚠️ Popup masih berhenti di endpoint perantara userver; callback akan diuji sebentar sebelum retry.');
+  }
+
+  return { page: adPage, host: adHost, intermediate };
 }
 
-async function harvestSession(origin) {
+async function harvestSessionAttempt(origin, sessionAttempt) {
   console.log('\n[2/5] 🤖 Menjalankan Headless Browser untuk verifikasi iklan...');
+  if (sessionAttempt > 1) {
+    console.log(`   -> Mengulang verifikasi dengan browser dan session proxy baru (${sessionAttempt}/2)...`);
+  }
   const puppeteer = resolvePuppeteer();
   const { browser, page, response, proxy } = await openNetMirrorPage(puppeteer, origin);
   let verifiedCookies = null;
@@ -395,72 +403,86 @@ async function harvestSession(origin) {
     console.log(`   -> Status data-addhash: ${initialHash.slice(0, 45)}...`);
     console.log(`   -> Format klasifikasi NetMirror: ${describeNetMirrorIpMarker(initialHash)}`);
 
-    console.log('   -> Tombol iklan ditemukan! Memicu klik verifikasi iklan...');
-    const adPage = await clickVerificationAd(page, browser, proxy);
-    console.log(`   -> Tombol iklan ditekan${adPage ? ' dan popup berhasil dibuka' : ''}. Menunggu callback verifikasi...`);
-
     console.log('\n[3/5] ⏳ Melakukan polling verifikasi ke /mobile/verify2.php...');
     let isAllDone = false;
-    const maxPollSeconds = 90;
+    const maxAdAttempts = 3;
 
-    for (let sec = 2; sec <= maxPollSeconds; sec += 2) {
-      await new Promise(r => setTimeout(r, 2000));
+    adAttempts:
+    for (let adAttempt = 1; adAttempt <= maxAdAttempts; adAttempt++) {
+      console.log(`\n   -> Percobaan popup iklan ${adAttempt}/${maxAdAttempts}...`);
+      const adResult = await clickVerificationAd(page, browser, proxy);
+      console.log(`   -> Tombol iklan ditekan${adResult.page ? ' dan popup berhasil dibuka' : ''}. Menunggu callback verifikasi...`);
 
-      let pollResult = null;
-      let navReloadDetected = false;
+      // Endpoint userver yang tidak meneruskan redirect biasanya tidak akan
+      // berhasil walau ditunggu lama. Beri 12 detik; landing eksternal diberi 24 detik.
+      const pollLimitSeconds = adResult.intermediate ? 12 : 24;
 
-      try {
-        pollResult = await page.evaluate(async (hash) => {
-          try {
-            const res = await fetch('/mobile/verify2.php', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                'X-Requested-With': 'XMLHttpRequest',
-              },
-              body: 'verify=' + encodeURIComponent(hash),
-            });
-            return await res.json();
-          } catch (e) {
-            return { error: e.message };
+      for (let sec = 2; sec <= pollLimitSeconds; sec += 2) {
+        await new Promise(r => setTimeout(r, 2000));
+
+        let pollResult = null;
+        let navReloadDetected = false;
+
+        try {
+          pollResult = await page.evaluate(async (hash) => {
+            try {
+              const res = await fetch('/mobile/verify2.php', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                  'X-Requested-With': 'XMLHttpRequest',
+                },
+                body: 'verify=' + encodeURIComponent(hash),
+              });
+              return await res.json();
+            } catch (e) {
+              return { error: e.message };
+            }
+          }, initialHash);
+        } catch (evalErr) {
+          // Ketika verifikasi sukses, script NetMirror otomatis menjalankan location.reload().
+          if (evalErr.message.includes('Execution context was destroyed') || evalErr.message.includes('navigating')) {
+            console.log(`\n   ℹ️ Terdeteksi auto-reload halaman dari NetMirror (indikasi verifikasi berhasil).`);
+            navReloadDetected = true;
+            await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
+          } else {
+            console.log(`\n   ⚠️ Polling eval info: ${evalErr.message.split('\n')[0]}`);
           }
-        }, initialHash);
-      } catch (evalErr) {
-        // Ketika verifikasi sukses, script NetMirror otomatis menjalankan location.reload().
-        // Ini menghancurkan execution context Puppeteer pada milidetik yang sama.
-        if (evalErr.message.includes('Execution context was destroyed') || evalErr.message.includes('navigating')) {
-          console.log(`\n   ℹ️ Terdeteksi auto-reload halaman dari NetMirror (indikasi All Done / verifikasi berhasil).`);
-          navReloadDetected = true;
-          await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
-        } else {
-          console.log(`\n   ⚠️ Polling eval info: ${evalErr.message.split('\n')[0]}`);
+        }
+
+        const checkCookies = await page.cookies().catch(() => []);
+        const hasSessionCookie = checkCookies.some(c => c.name === 't_hash_t' || c.name === 't_hash');
+        const statusText = pollResult?.statusup || pollResult?.error || (navReloadDetected ? 'Auto-Reloading Page' : 'Waiting response');
+        console.log(`   ⏱️ [Iklan ${adAttempt}/${maxAdAttempts} | ${sec}s] Status verifikasi: ${statusText}`);
+
+        if (navReloadDetected || pollResult?.statusup === 'All Done' || hasSessionCookie) {
+          console.log(`\n   🎉 VERIFIKASI BERHASIL pada percobaan iklan ${adAttempt}!`);
+          isAllDone = true;
+
+          if (!navReloadDetected) {
+            console.log('   -> Me-reload halaman untuk finalisasi cookie...');
+            await page.reload({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
+          }
+
+          console.log('   -> Memanggil p.php untuk sinkronisasi token...');
+          await page.evaluate(async () => {
+            try {
+              await fetch('/mobile/p.php', { method: 'POST' });
+            } catch (e) {}
+          }).catch(() => {});
+          await new Promise(r => setTimeout(r, 1000));
+          break adAttempts;
         }
       }
 
-      // Periksa apakah NetMirror sudah memasang cookie sesi t_hash / t_hash_t
-      const checkCookies = await page.cookies().catch(() => []);
-      const hasSessionCookie = checkCookies.some(c => c.name === 't_hash_t' || c.name === 't_hash');
+      if (adResult.page && !adResult.page.isClosed()) {
+        await adResult.page.close().catch(() => {});
+      }
 
-      const statusText = pollResult?.statusup || pollResult?.error || (navReloadDetected ? 'Auto-Reloading Page' : 'Waiting response');
-      console.log(`   ⏱️ [${sec}s] Status verifikasi: ${statusText}`);
-
-      if (navReloadDetected || pollResult?.statusup === 'All Done' || hasSessionCookie) {
-        console.log(`\n   ⏱️ [${sec}s] 🎉 VERIFIKASI BERHASIL! (All Done / Auto-Reload / Cookie Sesi Terdeteksi)`);
-        isAllDone = true;
-
-        if (!navReloadDetected) {
-          console.log('   -> Me-reload halaman untuk finalisasi cookie...');
-          await page.reload({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
-        }
-
-        console.log('   -> Memanggil p.php untuk sinkronisasi token...');
-        await page.evaluate(async () => {
-          try {
-            await fetch('/mobile/p.php', { method: 'POST' });
-          } catch (e) {}
-        }).catch(() => {});
+      if (adAttempt < maxAdAttempts) {
+        console.log(`   ⚠️ Callback iklan ${adAttempt} tidak diterima${adResult.host ? ` (host: ${adResult.host})` : ''}. Mencoba iklan baru...`);
+        await page.bringToFront().catch(() => {});
         await new Promise(r => setTimeout(r, 1000));
-        break;
       }
     }
 
@@ -489,7 +511,9 @@ async function harvestSession(origin) {
 
     if (!primaryToken) {
       console.log('   Daftar cookie yang ditemukan:', finalCookies.map(c => c.name).join(', '));
-      throw new Error('Verifikasi gagal: Cookie t_hash_t maupun t_hash tidak ditemukan.');
+      const error = new Error('Verifikasi gagal: Cookie t_hash_t maupun t_hash tidak ditemukan setelah semua percobaan iklan.');
+      error.code = 'AD_VERIFICATION_FAILED';
+      throw error;
     }
 
     // Uji coba probe pencarian langsung di browser sebelum ditutup
@@ -536,6 +560,26 @@ async function harvestSession(origin) {
   }
 
   return verifiedCookies;
+}
+
+async function harvestSession(origin) {
+  const maxBrowserSessions = 2;
+  let lastError = null;
+
+  for (let sessionAttempt = 1; sessionAttempt <= maxBrowserSessions; sessionAttempt++) {
+    try {
+      return await harvestSessionAttempt(origin, sessionAttempt);
+    } catch (error) {
+      lastError = error;
+      if (error.code !== 'AD_VERIFICATION_FAILED' || sessionAttempt === maxBrowserSessions) {
+        throw error;
+      }
+
+      console.log('\n   ⚠️ Semua popup pada browser ini gagal. Mengganti browser dan session proxy...');
+    }
+  }
+
+  throw lastError || new Error('Verifikasi iklan gagal tanpa detail tambahan.');
 }
 
 async function validateSession(origin, cookies) {
