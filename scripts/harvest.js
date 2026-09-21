@@ -14,6 +14,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 
 // Try loading environment variables if .env exists
@@ -48,23 +49,44 @@ const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 const IS_TEST_ONLY = process.argv.includes('--test-only');
 
 // Konfigurasi Residential Proxy (Default: Rainproxy Residential Jakarta, Indonesia)
-const RAW_PROXY = process.env.PROXY_SERVER || process.env.RESIDENTIAL_PROXY || 'http://uy9rgc3e3tb-country-ID-state-jakarta_raya-city-jakarta-session-bpu5qzx6:p7c3vz7ey9tz@resi-bridge-us.rainproxy.io:3333';
+const CONFIGURED_PROXY = process.env.PROXY_SERVER || process.env.RESIDENTIAL_PROXY || 'http://uy9rgc3e3tb-country-ID-state-jakarta_raya-city-jakarta-session-bpu5qzx6:p7c3vz7ey9tz@resi-bridge-us.rainproxy.io:3333';
+let activeProxyUrl = CONFIGURED_PROXY;
 
-let proxyHost = null;
-let proxyAuth = null;
+function createProxyConfig(rawProxy) {
+  if (!rawProxy) {
+    return { rawUrl: null, host: null, auth: null, sessionId: null };
+  }
 
-if (RAW_PROXY) {
   try {
-    const pUrl = new URL(RAW_PROXY);
-    proxyHost = `${pUrl.protocol}//${pUrl.host}`;
-    if (pUrl.username && pUrl.password) {
-      proxyAuth = {
+    const pUrl = new URL(rawProxy);
+    let username = decodeURIComponent(pUrl.username || '');
+    let sessionId = null;
+
+    // Rainproxy memakai bagian "-session-<id>" pada username untuk sticky IP.
+    // Buat ID baru pada setiap browser/retry agar tidak terus memakai exit node
+    // yang sedang lambat atau sudah dibatasi oleh target.
+    if (/rainproxy\.io$/i.test(pUrl.hostname) && username) {
+      sessionId = crypto.randomBytes(6).toString('hex');
+      if (/-session-[a-z0-9]+/i.test(username)) {
+        username = username.replace(/-session-[a-z0-9]+/i, `-session-${sessionId}`);
+      } else {
+        username += `-session-${sessionId}`;
+      }
+      pUrl.username = username;
+    }
+
+    const effectiveUrl = pUrl.toString();
+    return {
+      rawUrl: effectiveUrl,
+      host: `${pUrl.protocol}//${pUrl.host}`,
+      auth: pUrl.username && pUrl.password ? {
         username: decodeURIComponent(pUrl.username),
         password: decodeURIComponent(pUrl.password),
-      };
-    }
+      } : null,
+      sessionId,
+    };
   } catch (e) {
-    proxyHost = RAW_PROXY;
+    return { rawUrl: rawProxy, host: rawProxy, auth: null, sessionId: null };
   }
 }
 
@@ -116,39 +138,8 @@ function resolvePuppeteer() {
   try {
     return require('puppeteer');
   } catch (e) {
-    try {
-      return require('puppeteer-core');
-    } catch (e2) {
-      const scratchPuppeteer = path.join(
-        process.env.USERPROFILE || 'C:\\Users\\erwin',
-        '.gemini\\antigravity-ide\\brain\\7e30b8c0-52bc-4955-b16b-d07439b5aa54\\scratch\\node_modules\\puppeteer-core'
-      );
-      if (fs.existsSync(scratchPuppeteer)) {
-        return require(scratchPuppeteer);
-      }
-      throw new Error('Puppeteer tidak ditemukan. Jalankan: npm install');
-    }
+    throw new Error('Puppeteer lengkap tidak ditemukan. Jalankan "npm install" agar Chromium bawaan Puppeteer ikut terpasang.');
   }
-}
-
-function getChromePath() {
-  if (process.env.CHROME_PATH && fs.existsSync(process.env.CHROME_PATH)) {
-    return process.env.CHROME_PATH;
-  }
-  const defaultPaths = [
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    '/usr/bin/chromium-browser',
-    '/usr/bin/chromium',
-  ];
-  for (const p of defaultPaths) {
-    if (fs.existsSync(p)) return p;
-  }
-  return undefined;
 }
 
 function describeNetMirrorIpMarker(addHash) {
@@ -165,70 +156,222 @@ function describeNetMirrorIpMarker(addHash) {
   return 'ℹ️ FORMAT BARU/OPAQUE (server tidak mengirim marker tipe IP)';
 }
 
+async function openNetMirrorPage(puppeteer, origin) {
+  const targetUrl = `${origin}/mobile/home?app=1`;
+  const maxAttempts = 3;
+  const bundledChromium = puppeteer.executablePath();
+  let lastError = null;
+
+  if (!bundledChromium || !fs.existsSync(bundledChromium)) {
+    throw new Error('Chromium bawaan Puppeteer tidak ditemukan. Jalankan "npx puppeteer browsers install chrome".');
+  }
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const proxy = createProxyConfig(CONFIGURED_PROXY);
+    activeProxyUrl = proxy.rawUrl;
+
+    const launchOpts = {
+      headless: 'new',
+      executablePath: bundledChromium,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-web-security',
+        '--disable-background-networking',
+        '--disable-blink-features=AutomationControlled',
+        '--window-size=390,844',
+      ],
+    };
+
+    if (proxy.host) {
+      launchOpts.args.push(`--proxy-server=${proxy.host}`);
+      const sessionInfo = proxy.sessionId ? ` | Session baru: ${proxy.sessionId}` : '';
+      console.log(`   -> 🌐 Proxy: ${proxy.host} (Targeting: Indonesia/Jakarta)${sessionInfo}`);
+    }
+
+    console.log(`   -> Percobaan navigasi ${attempt}/${maxAttempts} memakai Chromium bawaan Puppeteer`);
+
+    let browser = null;
+    let page = null;
+    let blockInitialAssets = null;
+
+    try {
+      browser = await puppeteer.launch(launchOpts);
+      page = await browser.newPage();
+
+      if (proxy.auth) {
+        await page.authenticate(proxy.auth);
+      }
+
+      await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true });
+      await page.setUserAgent(MOBILE_UA);
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      });
+
+      // Popup iklan tidak diblokir agar request callback/tracking tetap berjalan.
+      browser.on('targetcreated', async (target) => {
+        if (target.type() !== 'page') return;
+        try {
+          const adPage = await target.page();
+          if (!adPage) return;
+          if (proxy.auth) await adPage.authenticate(proxy.auth);
+          await adPage.setUserAgent(MOBILE_UA);
+        } catch (e) {}
+      });
+
+      // Kurangi koneksi paralel hanya selama dokumen awal dimuat. Interception
+      // dinonaktifkan lagi sebelum tombol iklan ditekan agar pixel iklan aman.
+      await page.setRequestInterception(true);
+      blockInitialAssets = (request) => {
+        if (['image', 'font', 'media'].includes(request.resourceType())) {
+          request.abort('blockedbyclient').catch(() => {});
+        } else {
+          request.continue().catch(() => {});
+        }
+      };
+      page.on('request', blockInitialAssets);
+
+      console.log(`   -> Membuka: ${targetUrl}`);
+      const response = await page.goto(targetUrl, {
+        waitUntil: 'domcontentloaded',
+        timeout: 45000,
+      });
+
+      await page.setRequestInterception(false).catch(() => {});
+      page.off('request', blockInitialAssets);
+      blockInitialAssets = null;
+
+      const currentUrl = page.url();
+      if (currentUrl.startsWith('chrome-error://')) {
+        throw new Error(`Chromium membuka halaman error internal (${currentUrl}).`);
+      }
+      if (!response) {
+        throw new Error('Navigasi selesai tanpa respons HTTP utama.');
+      }
+
+      return { browser, page, response, proxy };
+    } catch (error) {
+      lastError = error;
+      const failedUrl = page && !page.isClosed() ? page.url() : '';
+      const isRetryable = /ERR_(TIMED_OUT|PROXY_CONNECTION_FAILED|TUNNEL_CONNECTION_FAILED|CONNECTION_RESET|CONNECTION_CLOSED)/i.test(error.message)
+        || failedUrl.startsWith('chrome-error://')
+        || /halaman error internal|tanpa respons HTTP utama/i.test(error.message);
+
+      if (page && blockInitialAssets && !page.isClosed()) {
+        await page.setRequestInterception(false).catch(() => {});
+        page.off('request', blockInitialAssets);
+      }
+      if (browser) await browser.close().catch(() => {});
+
+      if (!isRetryable || attempt === maxAttempts) {
+        throw new Error(`Navigasi ke NetMirror gagal setelah ${attempt} percobaan: ${error.message}`);
+      }
+
+      console.log(`   ⚠️ Navigasi gagal (${error.message}). Menutup browser dan mencoba session proxy baru...`);
+    }
+  }
+
+  throw new Error(`Navigasi ke NetMirror gagal: ${lastError?.message || 'alasan tidak diketahui'}`);
+}
+
+async function clickVerificationAd(page, browser, proxy) {
+  const candidates = await page.$$('.open-support, .checker');
+  let button = null;
+  let buttonInfo = null;
+
+  for (const candidate of candidates) {
+    const info = await candidate.evaluate((element) => {
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return {
+        className: element.className || '',
+        tagName: element.tagName,
+        visible: style.display !== 'none'
+          && style.visibility !== 'hidden'
+          && Number(style.opacity || 1) > 0
+          && rect.width > 0
+          && rect.height > 0,
+      };
+    }).catch(() => null);
+
+    if (info?.visible) {
+      button = candidate;
+      buttonInfo = info;
+      break;
+    }
+  }
+
+  if (!button) {
+    throw new Error(`Tombol verifikasi iklan terlihat tidak ditemukan (${candidates.length} kandidat ada di DOM).`);
+  }
+
+  console.log(`   -> Tombol aktif: <${buttonInfo.tagName.toLowerCase()}> class="${buttonInfo.className}"`);
+  await page.bringToFront();
+  await button.evaluate(element => element.scrollIntoView({ block: 'center', inline: 'center' }));
+  await new Promise(resolve => setTimeout(resolve, 500));
+
+  const popupTargetPromise = browser.waitForTarget(
+    target => target.type() === 'page' && target.opener() === page.target(),
+    { timeout: 15000 }
+  ).catch(() => null);
+
+  const box = await button.boundingBox();
+  if (!box) {
+    throw new Error('Tombol verifikasi kehilangan area klik sebelum interaksi dilakukan.');
+  }
+
+  // Gunakan pointer event nyata dari DevTools, bukan HTMLElement.click().
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 8 });
+  await page.mouse.down();
+  await new Promise(resolve => setTimeout(resolve, 180));
+  await page.mouse.up();
+
+  const popupTarget = await popupTargetPromise;
+  if (!popupTarget) {
+    console.log('   ⚠️ Klik tidak membuat popup baru; melanjutkan karena provider dapat memakai redirect/iframe.');
+    return null;
+  }
+
+  const adPage = await popupTarget.page();
+  if (!adPage) {
+    console.log('   ⚠️ Target iklan terbuat tetapi halaman popup tidak dapat diakses.');
+    return null;
+  }
+
+  if (proxy.auth) await adPage.authenticate(proxy.auth).catch(() => {});
+  await adPage.setUserAgent(MOBILE_UA).catch(() => {});
+  await adPage.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true }).catch(() => {});
+
+  // Beri kesempatan pada short-link iklan untuk menyelesaikan redirect dan
+  // callback server-side. Popup sengaja tidak ditutup selama polling.
+  await adPage.waitForFunction(() => location.href !== 'about:blank', { timeout: 15000 }).catch(() => {});
+  await new Promise(resolve => setTimeout(resolve, 8000));
+
+  let adUrl = adPage.url();
+  if (adUrl.startsWith('chrome-error://')) {
+    console.log('   ⚠️ Popup iklan mengalami error jaringan; mencoba reload satu kali...');
+    await adPage.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    adUrl = adPage.url();
+  }
+
+  let adHost = adUrl;
+  try {
+    adHost = new URL(adUrl).hostname || adUrl;
+  } catch (e) {}
+  console.log(`   -> Popup iklan aktif pada host: ${adHost}`);
+
+  return adPage;
+}
+
 async function harvestSession(origin) {
   console.log('\n[2/5] 🤖 Menjalankan Headless Browser untuk verifikasi iklan...');
   const puppeteer = resolvePuppeteer();
-  const chromePath = getChromePath();
-
-  const launchOpts = {
-    headless: 'new',
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-web-security',
-      '--disable-blink-features=AutomationControlled',
-      '--window-size=390,844',
-      '--blink-settings=imagesEnabled=true',
-    ],
-  };
-
-  if (proxyHost) {
-    console.log(`   -> 🌐 Menggunakan Residential Proxy: ${proxyHost} (Targeting: Indonesia/Jakarta)`);
-    launchOpts.args.push(`--proxy-server=${proxyHost}`);
-  }
-
-  if (chromePath) {
-    launchOpts.executablePath = chromePath;
-  }
-
-  const browser = await puppeteer.launch(launchOpts);
+  const { browser, page, response, proxy } = await openNetMirrorPage(puppeteer, origin);
   let verifiedCookies = null;
 
   try {
-    const page = await browser.newPage();
-    if (proxyAuth) {
-      await page.authenticate(proxyAuth);
-    }
-
-    await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true });
-    await page.setUserAgent(MOBILE_UA);
-
-    // Mask webdriver
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-    });
-
-    // Pantau tab popup iklan yang dibuka via window.open
-    browser.on('targetcreated', async (target) => {
-      if (target.type() === 'page') {
-        try {
-          const adPage = await target.page();
-          if (adPage) {
-            if (proxyAuth) await adPage.authenticate(proxyAuth);
-            await adPage.setUserAgent(MOBILE_UA);
-          }
-        } catch (e) {}
-      }
-    });
-
-    const targetUrl = `${origin}/mobile/home?app=1`;
-    console.log(`   -> Membuka: ${targetUrl}`);
-    const response = await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 35000 }).catch(async (err) => {
-      console.log(`   ⚠️ Peringatan saat navigasi (${err.message}), mencoba lanjut...`);
-      return null;
-    });
-
     const pageTitle = await page.title().catch(() => '');
     const currentUrl = page.url();
     const httpStatus = response ? response.status() : 'unknown';
@@ -252,19 +395,13 @@ async function harvestSession(origin) {
     console.log(`   -> Status data-addhash: ${initialHash.slice(0, 45)}...`);
     console.log(`   -> Format klasifikasi NetMirror: ${describeNetMirrorIpMarker(initialHash)}`);
 
-    // Cari dan klik tombol iklan
-    const button = await page.$('.open-support, .checker');
-    if (!button) {
-      throw new Error('Tombol verifikasi iklan (.open-support / .checker) tidak ditemukan di halaman.');
-    }
-
     console.log('   -> Tombol iklan ditemukan! Memicu klik verifikasi iklan...');
-    await button.click();
-    console.log('   -> Tombol iklan ditekan. Menunggu proses callback verifikasi (~25-35s)...');
+    const adPage = await clickVerificationAd(page, browser, proxy);
+    console.log(`   -> Tombol iklan ditekan${adPage ? ' dan popup berhasil dibuka' : ''}. Menunggu callback verifikasi...`);
 
     console.log('\n[3/5] ⏳ Melakukan polling verifikasi ke /mobile/verify2.php...');
     let isAllDone = false;
-    const maxPollSeconds = 45;
+    const maxPollSeconds = 90;
 
     for (let sec = 2; sec <= maxPollSeconds; sec += 2) {
       await new Promise(r => setTimeout(r, 2000));
@@ -415,14 +552,14 @@ async function validateSession(origin, cookies) {
   let data = null;
 
   // Jika proxy aktif, gunakan curl untuk memastikan request melalui residential proxy dan bypass TLS
-  if (RAW_PROXY) {
+  if (activeProxyUrl) {
     try {
       const curlBin = process.platform === 'win32' ? 'curl.exe' : 'curl';
       const args = [
         '-sL',
         '--max-time', '15',
         probeUrl,
-        '-x', RAW_PROXY,
+        '-x', activeProxyUrl,
         '-H', `User-Agent: ${MOBILE_UA}`,
         '-H', `Cookie: ${cookieHeader}`,
         '-H', `Referer: ${origin}/mobile/`,
