@@ -47,10 +47,121 @@ loadEnv();
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 const IS_TEST_ONLY = process.argv.includes('--test-only');
+const IS_NO_PROXY = process.argv.includes('--no-proxy');
+const IS_TRAFFIC_MEASURE = process.argv.includes('--measure-traffic');
+const IS_FULL_PROXY = process.argv.includes('--full-proxy') || process.env.FULL_PROXY === '1';
 
 // Konfigurasi Residential Proxy (Default: Rainproxy Residential Jakarta, Indonesia)
-const CONFIGURED_PROXY = process.env.PROXY_SERVER || process.env.RESIDENTIAL_PROXY || 'http://uy9rgc3e3tb-country-ID-state-jakarta_raya-city-jakarta-session-bpu5qzx6:p7c3vz7ey9tz@resi-bridge-us.rainproxy.io:3333';
+const CONFIGURED_PROXY = IS_NO_PROXY
+  ? null
+  : process.env.PROXY_SERVER || process.env.RESIDENTIAL_PROXY || 'http://uy9rgc3e3tb-country-ID-state-jakarta_raya-city-jakarta-session-bpu5qzx6:p7c3vz7ey9tz@resi-bridge-us.rainproxy.io:3333';
 let activeProxyUrl = CONFIGURED_PROXY;
+let activeProxyOriginHost = null;
+
+const trafficStats = {
+  downloadBytes: 0,
+  uploadBodyBytes: 0,
+  requests: 0,
+  byType: new Map(),
+  byPage: new Map(),
+  byHost: new Map(),
+  proxyDownloadBytes: 0,
+  proxyUploadBodyBytes: 0,
+};
+const trafficMeteredPages = new WeakSet();
+
+function addTrafficStat(map, key, bytes) {
+  map.set(key, (map.get(key) || 0) + bytes);
+}
+
+function getHost(url) {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch (e) {
+    return 'unknown';
+  }
+}
+
+function isProxyRoutedHost(host) {
+  if (!activeProxyUrl || !activeProxyOriginHost || !host) return false;
+  return host === activeProxyOriginHost || host.endsWith(`.${activeProxyOriginHost}`);
+}
+
+async function attachTrafficMeter(page, label) {
+  if (!IS_TRAFFIC_MEASURE || !page || trafficMeteredPages.has(page)) return;
+  trafficMeteredPages.add(page);
+
+  const client = await page.target().createCDPSession();
+  const requests = new Map();
+  await client.send('Network.enable');
+
+  client.on('Network.requestWillBeSent', event => {
+    const uploadBytes = event.request.postData ? Buffer.byteLength(event.request.postData) : 0;
+    const host = getHost(event.request.url);
+    requests.set(event.requestId, { host, type: 'Other' });
+    trafficStats.uploadBodyBytes += uploadBytes;
+    if (isProxyRoutedHost(host)) trafficStats.proxyUploadBodyBytes += uploadBytes;
+    trafficStats.requests += 1;
+  });
+
+  client.on('Network.responseReceived', event => {
+    const request = requests.get(event.requestId) || { host: getHost(event.response.url), type: 'Other' };
+    request.type = event.type || 'Other';
+    requests.set(event.requestId, request);
+  });
+
+  client.on('Network.loadingFinished', event => {
+    const bytes = Number(event.encodedDataLength) || 0;
+    const request = requests.get(event.requestId) || { host: 'unknown', type: 'Other' };
+    const type = request.type;
+    trafficStats.downloadBytes += bytes;
+    addTrafficStat(trafficStats.byType, type, bytes);
+    addTrafficStat(trafficStats.byPage, label, bytes);
+    addTrafficStat(trafficStats.byHost, request.host, bytes);
+    if (isProxyRoutedHost(request.host)) trafficStats.proxyDownloadBytes += bytes;
+    requests.delete(event.requestId);
+  });
+}
+
+function recordMeasuredBody(label, body, host = 'unknown') {
+  if (!IS_TRAFFIC_MEASURE) return;
+  const bytes = Buffer.byteLength(body || '');
+  trafficStats.downloadBytes += bytes;
+  trafficStats.requests += 1;
+  addTrafficStat(trafficStats.byType, 'NodeFetch', bytes);
+  addTrafficStat(trafficStats.byPage, label, bytes);
+  addTrafficStat(trafficStats.byHost, host, bytes);
+  if (isProxyRoutedHost(host)) trafficStats.proxyDownloadBytes += bytes;
+}
+
+function printTrafficSummary() {
+  if (!IS_TRAFFIC_MEASURE) return;
+
+  const measuredBytes = trafficStats.downloadBytes + trafficStats.uploadBodyBytes;
+  // Tambahkan 10% untuk request headers/TLS/protocol overhead yang tidak seluruhnya
+  // dilaporkan sebagai encodedDataLength oleh DevTools.
+  const estimatedBilledBytes = Math.ceil(measuredBytes * 1.10);
+  const proxyMeasuredBytes = trafficStats.proxyDownloadBytes + trafficStats.proxyUploadBodyBytes;
+  const proxyEstimatedBilledBytes = Math.ceil(proxyMeasuredBytes * 1.10);
+  const toMiB = bytes => (bytes / 1024 / 1024).toFixed(3);
+  const serializeMap = map => Object.fromEntries(
+    [...map.entries()].sort((a, b) => b[1] - a[1]).map(([key, bytes]) => [key, Number(toMiB(bytes))])
+  );
+
+  console.log('\n===========================================================');
+  console.log('📊 RINGKASAN TRAFIK RUN');
+  console.log('===========================================================');
+  console.log(`Mode koneksi             : ${IS_NO_PROXY ? 'DIRECT / TANPA PROXY' : IS_FULL_PROXY ? 'FULL PROXY' : 'PROXY SELEKTIF (NetMirror saja)'}`);
+  console.log(`Jumlah request tercatat  : ${trafficStats.requests}`);
+  console.log(`Download terukur         : ${toMiB(trafficStats.downloadBytes)} MiB`);
+  console.log(`Upload body terukur      : ${toMiB(trafficStats.uploadBodyBytes)} MiB`);
+  console.log(`Estimasi billing (+10%)  : ${toMiB(estimatedBilledBytes)} MiB`);
+  console.log(`Estimasi billing proxy   : ${toMiB(proxyEstimatedBilledBytes)} MiB`);
+  console.log(`Per halaman              : ${JSON.stringify(serializeMap(trafficStats.byPage))}`);
+  console.log(`Per tipe resource        : ${JSON.stringify(serializeMap(trafficStats.byType))}`);
+  console.log(`Per host                 : ${JSON.stringify(serializeMap(trafficStats.byHost))}`);
+  console.log(`PROXY_TRAFFIC_RESULT_BYTES=${proxyEstimatedBilledBytes}`);
+}
 
 function createProxyConfig(rawProxy) {
   if (!rawProxy) {
@@ -156,8 +267,24 @@ function describeNetMirrorIpMarker(addHash) {
   return 'ℹ️ FORMAT BARU/OPAQUE (server tidak mengirim marker tipe IP)';
 }
 
+function createSelectiveProxyPac(proxyHost, origin) {
+  const proxyEndpoint = new URL(proxyHost).host;
+  const originHost = new URL(origin).hostname.toLowerCase();
+  const pac = [
+    'function FindProxyForURL(url, host) {',
+    '  host = host.toLowerCase();',
+    `  if (host === ${JSON.stringify(originHost)} || shExpMatch(host, ${JSON.stringify(`*.${originHost}`)})) {`,
+    `    return ${JSON.stringify(`PROXY ${proxyEndpoint}`)};`,
+    '  }',
+    '  return "DIRECT";',
+    '}',
+  ].join('\n');
+  return `data:application/x-ns-proxy-autoconfig;base64,${Buffer.from(pac).toString('base64')}`;
+}
+
 async function openNetMirrorPage(puppeteer, origin) {
   const targetUrl = `${origin}/mobile/home?app=1`;
+  activeProxyOriginHost = new URL(origin).hostname.toLowerCase();
   const maxAttempts = 3;
   const bundledChromium = puppeteer.executablePath();
   let lastError = null;
@@ -185,8 +312,12 @@ async function openNetMirrorPage(puppeteer, origin) {
     };
 
     if (proxy.host) {
-      launchOpts.args.push(`--proxy-server=${proxy.host}`);
       const sessionInfo = proxy.sessionId ? ` | Session baru: ${proxy.sessionId}` : '';
+      if (IS_FULL_PROXY) {
+        launchOpts.args.push(`--proxy-server=${proxy.host}`);
+      } else {
+        launchOpts.args.push(`--proxy-pac-url=${createSelectiveProxyPac(proxy.host, origin)}`);
+      }
       console.log(`   -> 🌐 Proxy: ${proxy.host} (Targeting: Indonesia/Jakarta)${sessionInfo}`);
     }
 
@@ -199,6 +330,7 @@ async function openNetMirrorPage(puppeteer, origin) {
     try {
       browser = await puppeteer.launch(launchOpts);
       page = await browser.newPage();
+      await attachTrafficMeter(page, 'netmirror-main');
 
       if (proxy.auth) {
         await page.authenticate(proxy.auth);
@@ -216,6 +348,7 @@ async function openNetMirrorPage(puppeteer, origin) {
         try {
           const adPage = await target.page();
           if (!adPage) return;
+          await attachTrafficMeter(adPage, 'ad-popup');
           if (proxy.auth) await adPage.authenticate(proxy.auth);
           await adPage.setUserAgent(MOBILE_UA);
         } catch (e) {}
@@ -339,6 +472,8 @@ async function clickVerificationAd(page, browser, proxy) {
     console.log('   ⚠️ Target iklan terbuat tetapi halaman popup tidak dapat diakses.');
     return { page: null, host: null, intermediate: false };
   }
+
+  await attachTrafficMeter(adPage, 'ad-popup');
 
   if (proxy.auth) await adPage.authenticate(proxy.auth).catch(() => {});
   await adPage.setUserAgent(MOBILE_UA).catch(() => {});
@@ -611,6 +746,7 @@ async function validateSession(origin, cookies) {
       ];
       const res = spawnSync(curlBin, args, { encoding: 'utf-8' });
       if (res.stdout) {
+        recordMeasuredBody('validation-curl', res.stdout, getHost(probeUrl));
         data = JSON.parse(res.stdout);
       }
     } catch (e) {}
@@ -625,7 +761,9 @@ async function validateSession(origin, cookies) {
         'Referer': `${origin}/mobile/`,
       },
     });
-    data = await res.json().catch(() => null);
+    const responseBody = await res.text();
+    recordMeasuredBody('validation-fetch', responseBody, getHost(probeUrl));
+    data = JSON.parse(responseBody || 'null');
   }
 
   const status = data?.status;
@@ -723,7 +861,10 @@ async function main() {
   console.log('===========================================================');
 }
 
-main().catch(err => {
+main().then(() => {
+  printTrafficSummary();
+}).catch(err => {
   console.error('\n❌ ERROR FATAL PADA HARVESTER:', err.message);
-  process.exit(1);
+  printTrafficSummary();
+  process.exitCode = 1;
 });
