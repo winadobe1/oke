@@ -29,7 +29,7 @@ jobs:
           PROXY_SERVER: ${{ secrets.PROXY_SERVER || 'http://uy9rgc3e3tb-country-ID-state-jakarta_raya-city-jakarta-session-bpu5qzx6:p7c3vz7ey9tz@resi-bridge-us.rainproxy.io:3333' }}
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-        run: node scripts/harvest.js
+        run: node scripts/harvest.js --measure-traffic
 
       - name: 📤 Auto-Commit & Push token.json ke Repository
         run: |
