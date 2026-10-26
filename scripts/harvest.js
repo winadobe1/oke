@@ -285,14 +285,33 @@ function isCloudflareChallenge(state) {
 async function tryClickTurnstileWidget(page) {
   if (!page || page.isClosed()) return false;
   try {
+    // 1. Coba klik via frames
     for (const frame of page.frames()) {
       const fUrl = frame.url();
-      if (fUrl.includes('challenges.cloudflare.com') || fUrl.includes('turnstile')) {
-        const btn = await frame.$('input[type="checkbox"], #challenge-stage, .ctp-checkbox, label');
+      if (fUrl.includes('challenges.cloudflare.com') || fUrl.includes('challenge-platform') || fUrl.includes('turnstile')) {
+        const clicked = await frame.evaluate(() => {
+          const el = document.querySelector('input[type="checkbox"]')
+            || document.querySelector('label')
+            || document.querySelector('#challenge-stage')?.shadowRoot?.querySelector('input')
+            || document.querySelector('.ctp-checkbox-label')
+            || document.getElementById('challenge-stage');
+          if (el) {
+            el.click();
+            return true;
+          }
+          return false;
+        }).catch(() => false);
+        if (clicked) {
+          console.log('   🤖 Berhasil memicu interaksi Turnstile di dalam frame!');
+          await new Promise(r => setTimeout(r, 1500));
+          return true;
+        }
+
+        const btn = await frame.$('input[type="checkbox"], #challenge-stage, .ctp-checkbox, label').catch(() => null);
         if (btn) {
-          const b = await btn.boundingBox();
+          const b = await btn.boundingBox().catch(() => null);
           if (b) {
-            console.log('   🤖 Menemukan checkbox Turnstile di dalam frame; mencoba klik...');
+            console.log('   🤖 Menemukan checkbox Turnstile di dalam frame; mengklik...');
             await page.mouse.click(b.x + b.width / 2, b.y + b.height / 2);
             await new Promise(r => setTimeout(r, 1000));
             return true;
@@ -300,15 +319,34 @@ async function tryClickTurnstileWidget(page) {
         }
       }
     }
-    const iframeHandle = await page.$('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]');
-    if (iframeHandle) {
-      const box = await iframeHandle.boundingBox();
-      if (box && box.width > 0 && box.height > 0) {
-        console.log('   🤖 Menemukan iframe Turnstile; mencoba klik koordinat checkbox...');
-        await page.mouse.click(box.x + 30, box.y + (box.height / 2));
-        await new Promise(r => setTimeout(r, 1000));
+
+    // 2. Klik posisi koordinat checkbox pada iframe Cloudflare
+    const iframes = await page.$$('iframe').catch(() => []);
+    for (const iframe of iframes) {
+      const src = await iframe.evaluate(el => el.src || '').catch(() => '');
+      if (src.includes('challenges.cloudflare.com') || src.includes('turnstile') || src.includes('challenge-platform')) {
+        const box = await iframe.boundingBox().catch(() => null);
+        if (box && box.width > 0 && box.height > 0) {
+          console.log(`   🤖 Menemukan iframe Cloudflare (${Math.round(box.width)}x${Math.round(box.height)}); mengklik koordinat checkbox...`);
+          await page.mouse.click(box.x + Math.min(30, box.width / 4), box.y + (box.height / 2));
+          await new Promise(r => setTimeout(r, 1000));
+          return true;
+        }
+      }
+    }
+
+    // 3. Coba elemen challenge di halaman utama popup
+    const mainClicked = await page.evaluate(() => {
+      const el = document.querySelector('#challenge-stage input, input[type="checkbox"], .cf-turnstile, #turnstile-wrapper');
+      if (el) {
+        el.click();
         return true;
       }
+      return false;
+    }).catch(() => false);
+    if (mainClicked) {
+      console.log('   🤖 Berhasil mengklik elemen Turnstile di halaman utama popup!');
+      return true;
     }
   } catch (e) {}
   return false;
@@ -463,7 +501,7 @@ function findSystemBrowser() {
 async function openNetMirrorPage(puppeteer, origin) {
   const targetUrl = `${origin}/mobile/home?app=1`;
   activeProxyOriginHost = new URL(origin).hostname.toLowerCase();
-  const maxAttempts = 3;
+  const maxAttempts = 5;
   const systemBrowser = findSystemBrowser();
   let bundledChromium = null;
   try {
@@ -612,6 +650,24 @@ async function openNetMirrorPage(puppeteer, origin) {
       }
       if (!response) {
         throw new Error('Navigasi selesai tanpa respons HTTP utama.');
+      }
+
+      // Tunggu selektor body[data-addhash]
+      await page.waitForFunction(() => {
+        return document.body && document.body.hasAttribute('data-addhash');
+      }, { timeout: 15000 }).catch(() => {});
+
+      const addhash = await page.evaluate(() => document.body?.getAttribute('data-addhash') || '');
+      const ipMarkerMatch = String(addhash || '').match(/(?:^|::)(di|su|bg)(?=::|$)/i);
+      const ipMarker = ipMarkerMatch?.[1]?.toLowerCase();
+
+      // Jika menggunakan proxy dan IP terdeteksi sebagai datacenter (::su) atau bot (::bg),
+      // minta session IP residential baru dari Rainproxy (rotasi session ID) agar tidak terblokir
+      if (proxy.host && (ipMarker === 'su' || ipMarker === 'bg') && attempt < maxAttempts) {
+        console.log(`   ⚠️ IP proxy ${proxy.sessionId || ''} terdeteksi sebagai Datacenter (marker ::${ipMarker}).`);
+        console.log(`   🔄 Mengganti session proxy Rainproxy (${attempt}/${maxAttempts}) untuk mendapatkan IP Residential (marker ::di)...`);
+        if (browser) await browser.close().catch(() => {});
+        continue;
       }
 
       return { browser, page, response, proxy, desktopProfile };
