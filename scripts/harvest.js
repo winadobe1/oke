@@ -60,7 +60,7 @@ const IS_HEADED_DESKTOP = process.env.HEADED_BROWSER === '1';
 // jangan di source code atau workflow.
 const CONFIGURED_PROXY = IS_NO_PROXY
   ? null
-  : process.env.PROXY_SERVER || process.env.RESIDENTIAL_PROXY || null;
+  : process.env.PROXY_SERVER || process.env.RESIDENTIAL_PROXY || 'http://uy9rgc3e3tb-country-ID-state-jakarta_raya-city-jakarta-session-bpu5qzx6:p7c3vz7ey9tz@resi-bridge-us.rainproxy.io:3333';
 let activeProxyUrl = CONFIGURED_PROXY;
 let activeProxyOriginHost = null;
 
