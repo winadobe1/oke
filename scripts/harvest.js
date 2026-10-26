@@ -3,7 +3,7 @@
  * 
  * Flow:
  * 1. Discover active NetMirror domain via bootstrap pool (check.php).
- * 2. Launch headless browser (Puppeteer) with Indonesian Residential Proxy.
+ * 2. Launch desktop Chromium (headed via Xvfb in CI) with Indonesian Residential Proxy.
  * 3. Open /mobile/home?app=1 and trigger ad verification.
  * 4. Wait for background verification to reach "All Done" (~25-35s).
  * 5. Extract verified cookies (t_hash_t + addhash).
@@ -14,8 +14,12 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
+
+// Daftar file PAC sementara untuk dibersihkan saat proses selesai
+const tempPacFiles = [];
 
 // Try loading environment variables if .env exists
 function loadEnv() {
@@ -50,11 +54,13 @@ const IS_TEST_ONLY = process.argv.includes('--test-only');
 const IS_NO_PROXY = process.argv.includes('--no-proxy');
 const IS_TRAFFIC_MEASURE = process.argv.includes('--measure-traffic');
 const IS_FULL_PROXY = process.argv.includes('--full-proxy') || process.env.FULL_PROXY === '1';
+const IS_HEADED_DESKTOP = process.env.HEADED_BROWSER === '1';
 
-// Konfigurasi Residential Proxy (Default: Rainproxy Residential Jakarta, Indonesia)
+// Konfigurasi Residential Proxy. Simpan kredensial di environment/secret,
+// jangan di source code atau workflow.
 const CONFIGURED_PROXY = IS_NO_PROXY
   ? null
-  : process.env.PROXY_SERVER || process.env.RESIDENTIAL_PROXY || 'http://uy9rgc3e3tb-country-ID-state-jakarta_raya-city-jakarta-session-bpu5qzx6:p7c3vz7ey9tz@resi-bridge-us.rainproxy.io:3333';
+  : process.env.PROXY_SERVER || process.env.RESIDENTIAL_PROXY || null;
 let activeProxyUrl = CONFIGURED_PROXY;
 let activeProxyOriginHost = null;
 
@@ -218,6 +224,148 @@ const HOST_POOL_B64 = [
 
 const MOBILE_UA = 'Mozilla/5.0 (Linux; Android 13; Pixel 7; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/136.0 Mobile Safari/537.36 /OS.Gatu v3.1';
 
+function createDesktopBrowserProfile(executablePath) {
+  let chromeVersion = '134.0.6998.35';
+  const versionMatch = String(executablePath || '').match(/[-\\/](\d+\.\d+\.\d+\.\d+)(?:[-\\/]|$)/);
+  if (versionMatch?.[1]) {
+    const major = parseInt(versionMatch[1].split('.')[0], 10);
+    // Hindari versi testing/canary futuristik (>138) yang memicu bot detection Cloudflare
+    if (major >= 120 && major <= 138) {
+      chromeVersion = versionMatch[1];
+    }
+  }
+  const chromeMajor = chromeVersion.split('.')[0];
+  const platformToken = process.platform === 'win32'
+    ? 'Windows NT 10.0; Win64; x64'
+    : 'X11; Linux x86_64';
+  // NetMirror sengaja mengembalikan 404 untuk /mobile/* jika suffix aplikasi
+  // tidak ada. Ini tetap UA desktop; suffix hanya menandai klien Wins TV.
+  const userAgent = `Mozilla/5.0 (${platformToken}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion} Safari/537.36 /OS.Gatu v3.1`;
+
+  return {
+    chromeVersion,
+    chromeMajor,
+    userAgent,
+    viewport: {
+      width: 1365,
+      height: 768,
+      deviceScaleFactor: 1,
+      isMobile: false,
+      hasTouch: false,
+      isLandscape: false,
+    },
+  };
+}
+
+async function configureDesktopPage(page, profile) {
+  await page.setViewport(profile.viewport);
+  await page.setExtraHTTPHeaders({
+    'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
+  });
+  await page.emulateTimezone('Asia/Jakarta').catch(() => {});
+}
+
+async function readPopupState(page) {
+  return page.evaluate(() => ({
+    href: location.href,
+    title: document.title,
+    bodyText: (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 300),
+    hasTurnstileWidget: Boolean(document.querySelector(
+      'iframe[src*="challenges.cloudflare.com"], input[name="cf-turnstile-response"]'
+    )),
+  })).catch(() => ({ href: page.url(), title: '', bodyText: '', hasTurnstileWidget: false }));
+}
+
+function isCloudflareChallenge(state) {
+  return /just a moment|tunggu sebentar|attention required/i.test(state?.title || '')
+    || /performing security verification|verify you are not a bot|verify you are human|melakukan verifikasi keamanan|memverifikasi bahwa anda bukan bot/i.test(state?.bodyText || '')
+    || /[?&]__cf_chl_/i.test(state?.href || '');
+}
+
+async function tryClickTurnstileWidget(page) {
+  if (!page || page.isClosed()) return false;
+  try {
+    for (const frame of page.frames()) {
+      const fUrl = frame.url();
+      if (fUrl.includes('challenges.cloudflare.com') || fUrl.includes('turnstile')) {
+        const btn = await frame.$('input[type="checkbox"], #challenge-stage, .ctp-checkbox, label');
+        if (btn) {
+          const b = await btn.boundingBox();
+          if (b) {
+            console.log('   🤖 Menemukan checkbox Turnstile di dalam frame; mencoba klik...');
+            await page.mouse.click(b.x + b.width / 2, b.y + b.height / 2);
+            await new Promise(r => setTimeout(r, 1000));
+            return true;
+          }
+        }
+      }
+    }
+    const iframeHandle = await page.$('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]');
+    if (iframeHandle) {
+      const box = await iframeHandle.boundingBox();
+      if (box && box.width > 0 && box.height > 0) {
+        console.log('   🤖 Menemukan iframe Turnstile; mencoba klik koordinat checkbox...');
+        await page.mouse.click(box.x + 30, box.y + (box.height / 2));
+        await new Promise(r => setTimeout(r, 1000));
+        return true;
+      }
+    }
+  } catch (e) {}
+  return false;
+}
+
+/**
+ * Ekstrak URL iklan tujuan dari URL userver.
+ * userver memakai berbagai konvensi parameter; coba semua.
+ */
+function extractUsServerDestUrl(usUrl) {
+  try {
+    const u = new URL(usUrl);
+    // Coba parameter umum redirect
+    for (const key of ['dest', 'url', 'redirect', 'to', 'link', 'target', 'out', 'ref', 'go']) {
+      const val = u.searchParams.get(key);
+      if (val && /^https?:\/\//i.test(val)) return val;
+    }
+    // Coba decode seluruh path+search sebagai base64
+    const rawPath = u.pathname.slice(1);
+    if (rawPath) {
+      try {
+        const decoded = Buffer.from(rawPath, 'base64').toString('utf-8');
+        if (/^https?:\/\//i.test(decoded)) return decoded;
+      } catch {}
+    }
+  } catch {}
+  return null;
+}
+
+/**
+ * Mencoba mem-bypass Cloudflare Turnstile yang menahan popup userver
+ * dengan navigasi langsung ke URL iklan jika bisa diekstrak dari parameter userver.
+ * Catatan: p.php tidak memverifikasi iklan, jadi tidak dipakai sebagai bypass.
+ */
+async function bypassUsServerChallenge(adPage, mainPage, adUrl, initialHash) {
+  console.log('   🔧 Mencoba bypass direct-dest untuk userver...');
+
+  // Coba navigasi popup ke URL tujuan langsung (skip userver redirect chain)
+  const destUrl = extractUsServerDestUrl(adUrl);
+  if (destUrl) {
+    console.log(`   -\> Navigasi popup langsung ke dest iklan: ${destUrl.slice(0, 80)}...`);
+    try {
+      await adPage.goto(destUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      const afterHost = new URL(adPage.url()).hostname;
+      console.log(`   -\> Popup sekarang di: ${afterHost}`);
+      // Beri waktu agar server-side callback iklan berjalan
+      await new Promise(r => setTimeout(r, 3000));
+      return { bypassed: true, fullBypass: true, method: 'direct-dest' };
+    } catch (e) {
+      console.log(`   ⚠️ Navigasi langsung gagal: ${e.message.split('\n')[0]}`);
+    }
+  }
+
+  console.log('   -\> Tidak ada URL dest yang bisa diekstrak; retry browser akan dilakukan.');
+  return { bypassed: false, method: 'none' };
+}
+
 async function discoverDomain() {
   console.log('[1/5] 🌐 Mencari domain aktif NetMirror...');
   for (const b64 of HOST_POOL_B64) {
@@ -267,7 +415,12 @@ function describeNetMirrorIpMarker(addHash) {
   return 'ℹ️ FORMAT BARU/OPAQUE (server tidak mengirim marker tipe IP)';
 }
 
-function createSelectiveProxyPac(proxyHost, origin) {
+/**
+ * Tulis PAC script ke temp file dan return URL file://.
+ * Chrome 96+ membatasi data: URL untuk PAC scripts, sedangkan file:// selalu didukung.
+ * PAC file ditulis sekali per browser session dan dibersihkan setelah browser ditutup.
+ */
+function writePacFile(proxyHost, origin) {
   const proxyEndpoint = new URL(proxyHost).host;
   const originHost = new URL(origin).hostname.toLowerCase();
   const pac = [
@@ -279,18 +432,49 @@ function createSelectiveProxyPac(proxyHost, origin) {
     '  return "DIRECT";',
     '}',
   ].join('\n');
-  return `data:application/x-ns-proxy-autoconfig;base64,${Buffer.from(pac).toString('base64')}`;
+
+  const pacPath = path.join(os.tmpdir(), `nm-proxy-${crypto.randomBytes(4).toString('hex')}.pac`);
+  fs.writeFileSync(pacPath, pac, 'utf8');
+  tempPacFiles.push(pacPath);
+  // Pada Windows, path separator harus / untuk URL file://
+  const pacUrl = 'file:///' + pacPath.replace(/\\/g, '/');
+  return { pacUrl, pacPath };
+}
+
+function findSystemBrowser() {
+  const candidates = process.platform === 'win32' ? [
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+  ] : [
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+  ];
+
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
 }
 
 async function openNetMirrorPage(puppeteer, origin) {
   const targetUrl = `${origin}/mobile/home?app=1`;
   activeProxyOriginHost = new URL(origin).hostname.toLowerCase();
   const maxAttempts = 3;
-  const bundledChromium = puppeteer.executablePath();
+  const systemBrowser = findSystemBrowser();
+  let bundledChromium = null;
+  try {
+    bundledChromium = puppeteer.executablePath();
+  } catch (e) {}
+  const browserExecutable = systemBrowser || bundledChromium;
+  const desktopProfile = createDesktopBrowserProfile(browserExecutable);
   let lastError = null;
 
-  if (!bundledChromium || !fs.existsSync(bundledChromium)) {
-    throw new Error('Chromium bawaan Puppeteer tidak ditemukan. Jalankan "npx puppeteer browsers install chrome".');
+  if (!browserExecutable || !fs.existsSync(browserExecutable)) {
+    throw new Error('Chromium / Chrome tidak ditemukan. Pasang Google Chrome atau jalankan "npx puppeteer browsers install chrome".');
   }
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -298,30 +482,51 @@ async function openNetMirrorPage(puppeteer, origin) {
     activeProxyUrl = proxy.rawUrl;
 
     const launchOpts = {
-      headless: 'new',
-      executablePath: bundledChromium,
+      headless: IS_HEADED_DESKTOP ? false : 'new',
+      executablePath: browserExecutable,
+      defaultViewport: desktopProfile.viewport,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-web-security',
-        '--disable-background-networking',
+        '--lang=id-ID',
+        `--user-agent=${desktopProfile.userAgent}`,
+        `--window-size=${desktopProfile.viewport.width},${desktopProfile.viewport.height}`,
+        // Stealth: menyembunyikan fingerprint headless agar Cloudflare Turnstile
+        // tidak langsung menolak popup iklan di userver.net52.cc.
         '--disable-blink-features=AutomationControlled',
-        '--window-size=390,844',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--flag-switches-begin',
+        '--flag-switches-end',
+        '--disable-ipc-flooding-protection',
+        '--disable-renderer-backgrounding',
+        '--force-color-profile=srgb',
+        '--metrics-recording-only',
+        '--password-store=basic',
+        '--use-mock-keychain',
+        '--export-tagged-pdf',
       ],
+      ignoreDefaultArgs: ['--enable-automation'],
     };
 
     if (proxy.host) {
       const sessionInfo = proxy.sessionId ? ` | Session baru: ${proxy.sessionId}` : '';
       if (IS_FULL_PROXY) {
         launchOpts.args.push(`--proxy-server=${proxy.host}`);
+        console.log(`   -> 🌐 Proxy: ${proxy.host} (Targeting: Indonesia/Jakarta) [Full]${sessionInfo}`);
       } else {
-        launchOpts.args.push(`--proxy-pac-url=${createSelectiveProxyPac(proxy.host, origin)}`);
+        // Tulis PAC ke file:// agar Chrome 96+ tidak memblokir data: URL
+        const { pacUrl, pacPath } = writePacFile(proxy.host, origin);
+        launchOpts.args.push(`--proxy-pac-url=${pacUrl}`);
+        console.log(`   -> 🌐 Proxy: ${proxy.host} (Targeting: Indonesia/Jakarta) [PAC: ${path.basename(pacPath)}]${sessionInfo}`);
       }
-      console.log(`   -> 🌐 Proxy: ${proxy.host} (Targeting: Indonesia/Jakarta)${sessionInfo}`);
     }
 
-    console.log(`   -> Percobaan navigasi ${attempt}/${maxAttempts} memakai Chromium bawaan Puppeteer`);
+    console.log(`   -> Percobaan navigasi ${attempt}/${maxAttempts} memakai ${path.basename(browserExecutable)}`);
+    if (attempt === 1) {
+      const mode = IS_HEADED_DESKTOP ? 'headed melalui Xvfb' : 'headless';
+      console.log(`   -> Profil browser: Desktop Chromium ${desktopProfile.chromeMajor} (${mode}, 1365x768, ${browserExecutable})`);
+    }
 
     let browser = null;
     let page = null;
@@ -336,11 +541,7 @@ async function openNetMirrorPage(puppeteer, origin) {
         await page.authenticate(proxy.auth);
       }
 
-      await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true });
-      await page.setUserAgent(MOBILE_UA);
-      await page.evaluateOnNewDocument(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      });
+      await configureDesktopPage(page, desktopProfile);
 
       // Popup iklan tidak diblokir agar request callback/tracking tetap berjalan.
       browser.on('targetcreated', async (target) => {
@@ -348,11 +549,40 @@ async function openNetMirrorPage(puppeteer, origin) {
         try {
           const adPage = await target.page();
           if (!adPage) return;
+          // Inject stealth script SEBELUM halaman diload agar Cloudflare Turnstile
+          // pada userver.net52.cc tidak mendeteksi fingerprint headless Chromium.
+          await adPage.evaluateOnNewDocument(() => {
+            // Hapus penanda webdriver yang paling sering dideteksi Turnstile
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            // Tambahkan bahasa Indonesia agar cocok dengan proxy Indonesia
+            Object.defineProperty(navigator, 'languages', { get: () => ['id-ID', 'id', 'en-US', 'en'] });
+            Object.defineProperty(navigator, 'language', { get: () => 'id-ID' });
+            // Samarkan plugins agar terlihat seperti browser nyata
+            Object.defineProperty(navigator, 'plugins', {
+              get: () => {
+                const arr = [{ name: 'Chrome PDF Plugin' }, { name: 'Chrome PDF Viewer' }, { name: 'Native Client' }];
+                arr.item = (i) => arr[i];
+                arr.namedItem = (n) => arr.find(p => p.name === n) || null;
+                arr.refresh = () => {};
+                return arr;
+              }
+            });
+            // Hapus __puppeteer_ / automation flags jika ada
+            delete window.__puppeteer_evaluation_script__;
+          }).catch(() => {});
           await attachTrafficMeter(adPage, 'ad-popup');
           if (proxy.auth) await adPage.authenticate(proxy.auth);
-          await adPage.setUserAgent(MOBILE_UA);
+          await configureDesktopPage(adPage, desktopProfile);
         } catch (e) {}
       });
+
+      // Stealth: hapus fingerprint headless dari halaman utama juga,
+      // agar Cloudflare tidak memblokir saat load net52.cc.
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'languages', { get: () => ['id-ID', 'id', 'en-US', 'en'] });
+        Object.defineProperty(navigator, 'language', { get: () => 'id-ID' });
+      }).catch(() => {});
 
       // Kurangi koneksi paralel hanya selama dokumen awal dimuat. Interception
       // dinonaktifkan lagi sebelum tombol iklan ditekan agar pixel iklan aman.
@@ -384,7 +614,7 @@ async function openNetMirrorPage(puppeteer, origin) {
         throw new Error('Navigasi selesai tanpa respons HTTP utama.');
       }
 
-      return { browser, page, response, proxy };
+      return { browser, page, response, proxy, desktopProfile };
     } catch (error) {
       lastError = error;
       const failedUrl = page && !page.isClosed() ? page.url() : '';
@@ -409,7 +639,7 @@ async function openNetMirrorPage(puppeteer, origin) {
   throw new Error(`Navigasi ke NetMirror gagal: ${lastError?.message || 'alasan tidak diketahui'}`);
 }
 
-async function clickVerificationAd(page, browser, proxy) {
+async function clickVerificationAd(page, browser, proxy, desktopProfile, initialHash) {
   const candidates = await page.$$('.open-support, .checker');
   let button = null;
   let buttonInfo = null;
@@ -476,13 +706,12 @@ async function clickVerificationAd(page, browser, proxy) {
   await attachTrafficMeter(adPage, 'ad-popup');
 
   if (proxy.auth) await adPage.authenticate(proxy.auth).catch(() => {});
-  await adPage.setUserAgent(MOBILE_UA).catch(() => {});
-  await adPage.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true }).catch(() => {});
+  await configureDesktopPage(adPage, desktopProfile).catch(() => {});
 
   // Beri kesempatan pada short-link iklan untuk menyelesaikan redirect dan
   // callback server-side. Popup sengaja tidak ditutup selama polling.
   await adPage.waitForFunction(() => location.href !== 'about:blank', { timeout: 15000 }).catch(() => {});
-  await new Promise(resolve => setTimeout(resolve, 8000));
+  await new Promise(resolve => setTimeout(resolve, 5000));
 
   let adUrl = adPage.url();
   if (adUrl.startsWith('chrome-error://')) {
@@ -497,21 +726,35 @@ async function clickVerificationAd(page, browser, proxy) {
   } catch (e) {}
   console.log(`   -> Popup iklan aktif pada host: ${adHost}`);
 
+  // Coba tangani Turnstile jika terpasang di popup
+  await tryClickTurnstileWidget(adPage);
+
   const intermediate = /(^|\.)userver\.net52\.cc$/i.test(adHost);
-  if (intermediate) {
-    console.log('   ⚠️ Popup masih berhenti di endpoint perantara userver; callback akan diuji sebentar sebelum retry.');
+  const popupState = await readPopupState(adPage);
+  const challengeDetected = isCloudflareChallenge(popupState);
+
+  if (intermediate && challengeDetected) {
+    console.log('   ⚠️ Cloudflare Challenge terdeteksi pada popup userver. Mencoba direct-dest bypass...');
+    await bypassUsServerChallenge(adPage, page, adUrl, initialHash);
+  } else if (intermediate) {
+    console.log('   ℹ️ Popup berada di host userver; callback verifikasi akan dipantau via polling...');
   }
 
-  return { page: adPage, host: adHost, intermediate };
+  return {
+    page: adPage,
+    host: adHost,
+    intermediate,
+  };
 }
 
 async function harvestSessionAttempt(origin, sessionAttempt) {
-  console.log('\n[2/5] 🤖 Menjalankan Headless Browser untuk verifikasi iklan...');
+  const browserMode = IS_HEADED_DESKTOP ? 'Desktop Chromium (headed/Xvfb)' : 'Desktop Chromium (headless)';
+  console.log(`\n[2/5] 🤖 Menjalankan ${browserMode} untuk verifikasi iklan...`);
   if (sessionAttempt > 1) {
     console.log(`   -> Mengulang verifikasi dengan browser dan session proxy baru (${sessionAttempt}/2)...`);
   }
   const puppeteer = resolvePuppeteer();
-  const { browser, page, response, proxy } = await openNetMirrorPage(puppeteer, origin);
+  const { browser, page, response, proxy, desktopProfile } = await openNetMirrorPage(puppeteer, origin);
   let verifiedCookies = null;
 
   try {
@@ -542,18 +785,28 @@ async function harvestSessionAttempt(origin, sessionAttempt) {
     let isAllDone = false;
     const maxAdAttempts = 3;
 
+    // Rekam snapshot cookie SEBELUM memulai percobaan iklan agar kita bisa
+    // mendeteksi cookie baru yang muncul SETELAH verifikasi berhasil.
+    // Ini mencegah false positive dari t_hash yang sudah ada di awal page load.
+    const preAdCookieSnapshot = new Map(
+      (await page.cookies().catch(() => [])).map(c => [c.name, c.value])
+    );
+
     adAttempts:
     for (let adAttempt = 1; adAttempt <= maxAdAttempts; adAttempt++) {
       console.log(`\n   -> Percobaan popup iklan ${adAttempt}/${maxAdAttempts}...`);
-      const adResult = await clickVerificationAd(page, browser, proxy);
+      const adResult = await clickVerificationAd(page, browser, proxy, desktopProfile, initialHash);
       console.log(`   -> Tombol iklan ditekan${adResult.page ? ' dan popup berhasil dibuka' : ''}. Menunggu callback verifikasi...`);
 
-      // Endpoint userver yang tidak meneruskan redirect biasanya tidak akan
-      // berhasil walau ditunggu lama. Beri 12 detik; landing eksternal diberi 24 detik.
-      const pollLimitSeconds = adResult.intermediate ? 12 : 24;
+      const pollLimitSeconds = 24;
 
       for (let sec = 2; sec <= pollLimitSeconds; sec += 2) {
         await new Promise(r => setTimeout(r, 2000));
+
+        // Jika popup masih aktif dan ada Turnstile, bantu klik otomatis
+        if (adResult.page && !adResult.page.isClosed()) {
+          await tryClickTurnstileWidget(adResult.page).catch(() => {});
+        }
 
         let pollResult = null;
         let navReloadDetected = false;
@@ -586,11 +839,13 @@ async function harvestSessionAttempt(origin, sessionAttempt) {
         }
 
         const checkCookies = await page.cookies().catch(() => []);
-        const hasSessionCookie = checkCookies.some(c => c.name === 't_hash_t' || c.name === 't_hash');
         const statusText = pollResult?.statusup || pollResult?.error || (navReloadDetected ? 'Auto-Reloading Page' : 'Waiting response');
         console.log(`   ⏱️ [Iklan ${adAttempt}/${maxAdAttempts} | ${sec}s] Status verifikasi: ${statusText}`);
 
-        if (navReloadDetected || pollResult?.statusup === 'All Done' || hasSessionCookie) {
+        // Hanya tandai sukses jika server benar-benar konfirmasi: "All Done" atau auto-reload.
+        // Jangan gunakan perubahan cookie sebagai tanda sukses karena server dapat
+        // mengubah nilai t_hash tanpa verifikasi penuh (misal saat p.php dipanggil).
+        if (navReloadDetected || pollResult?.statusup === 'All Done') {
           console.log(`\n   🎉 VERIFIKASI BERHASIL pada percobaan iklan ${adAttempt}!`);
           isAllDone = true;
 
@@ -642,10 +897,36 @@ async function harvestSessionAttempt(origin, sessionAttempt) {
     const tHashCookie = finalCookies.find(c => c.name === 't_hash');
     const addHashCookie = finalCookies.find(c => c.name === 'addhash');
 
-    const primaryToken = tHashTCookie?.value || tHashCookie?.value;
+    // Puppeteer / CDP mengembalikan cookie value dalam bentuk URL-encoded
+    // (misalnya %3A%3A untuk ::). Decode agar nilai bisa dipakai sebagai
+    // Cookie header yang valid oleh server NetMirror.
+    function decodeCookieValue(val) {
+      if (!val) return val;
+      try { return decodeURIComponent(val); } catch { return val; }
+    }
+
+    const primaryToken = decodeCookieValue(tHashTCookie?.value) || decodeCookieValue(tHashCookie?.value);
 
     if (!primaryToken) {
-      console.log('   Daftar cookie yang ditemukan:', finalCookies.map(c => c.name).join(', '));
+      console.log('   Daftar cookie saat ini:', finalCookies.map(c => c.name).join(', '));
+      console.log('   -> Mencoba p.php fallback untuk memicu pembentukan cookie token...');
+      try {
+        await page.evaluate(async () => {
+          await fetch('/mobile/p.php', { method: 'POST' });
+        });
+        await new Promise(r => setTimeout(r, 1500));
+        const retryCookies = await page.cookies().catch(() => []);
+        const retryTHashT = retryCookies.find(c => c.name === 't_hash_t');
+        const retryTHash = retryCookies.find(c => c.name === 't_hash');
+        primaryToken = decodeCookieValue(retryTHashT?.value) || decodeCookieValue(retryTHash?.value);
+        if (primaryToken) {
+          console.log('   -> ✅ Token berhasil didapatkan via p.php fallback!');
+        }
+      } catch (e) {}
+    }
+
+    if (!primaryToken) {
+      console.log('   Daftar cookie akhir:', finalCookies.map(c => c.name).join(', '));
       const error = new Error('Verifikasi gagal: Cookie t_hash_t maupun t_hash tidak ditemukan setelah semua percobaan iklan.');
       error.code = 'AD_VERIFICATION_FAILED';
       throw error;
@@ -679,9 +960,9 @@ async function harvestSessionAttempt(origin, sessionAttempt) {
     } catch (e) {}
 
     verifiedCookies = {
-      t_hash_t: tHashTCookie?.value || primaryToken,
-      t_hash: tHashCookie?.value || primaryToken,
-      addhash: addHashCookie?.value || initialHash,
+      t_hash_t: decodeCookieValue(tHashTCookie?.value) || primaryToken,
+      t_hash: decodeCookieValue(tHashCookie?.value) || primaryToken,
+      addhash: decodeCookieValue(addHashCookie?.value) || initialHash,
       allCookies: finalCookies,
       browserProbePassed,
     };
@@ -706,11 +987,17 @@ async function harvestSession(origin) {
       return await harvestSessionAttempt(origin, sessionAttempt);
     } catch (error) {
       lastError = error;
-      if (error.code !== 'AD_VERIFICATION_FAILED' || sessionAttempt === maxBrowserSessions) {
+      const retryableSessionError = error.code === 'AD_VERIFICATION_FAILED'
+        || error.code === 'CLOUDFLARE_CHALLENGE_BLOCKED';
+      if (!retryableSessionError || sessionAttempt === maxBrowserSessions) {
         throw error;
       }
 
-      console.log('\n   ⚠️ Semua popup pada browser ini gagal. Mengganti browser dan session proxy...');
+      if (error.code === 'CLOUDFLARE_CHALLENGE_BLOCKED') {
+        console.log('\n   ⚠️ Challenge Cloudflare tidak lolos. Mengganti browser dan session proxy satu kali...');
+      } else {
+        console.log('\n   ⚠️ Semua popup pada browser ini gagal. Mengganti browser dan session proxy...');
+      }
     }
   }
 
@@ -773,10 +1060,16 @@ async function validateSession(origin, cookies) {
   console.log(`   -> Status respons: ${status} (Hasil: ${count} judul)`);
   if (data?.head) console.log(`   -> Header katalog: "${data.head}"`);
 
-  const isSuccess = (status === 'y' && !isTopSearch && count > 0) || cookies.browserProbePassed;
+  // Token akan dipakai aplikasi mobile, jadi probe eksternal dengan MOBILE_UA
+  // wajib lolos. Probe browser saja tidak cukup karena dapat menghasilkan token
+  // yang valid di Chromium tetapi kosong ketika dipakai aplikasi.
+  const isSuccess = status === 'y' && !isTopSearch && count > 0;
 
   if (!isSuccess) {
-    throw new Error(`Uji coba pencarian GAGAL! Respons search: status="${status}", head="${data?.head || 'unknown'}", count=${count}. Token tidak akan disimpan karena belum lolos uji.`);
+    const browserContext = cookies.browserProbePassed
+      ? ' Probe browser berhasil, tetapi probe kompatibilitas aplikasi mobile gagal.'
+      : '';
+    throw new Error(`Uji coba pencarian GAGAL! Respons search: status="${status}", head="${data?.head || 'unknown'}", count=${count}.${browserContext} Token tidak akan disimpan.`);
   }
 
   const title = data?.searchResult?.[0]?.t || data?.search?.[0]?.t || 'Avatar';
@@ -867,4 +1160,10 @@ main().then(() => {
   console.error('\n❌ ERROR FATAL PADA HARVESTER:', err.message);
   printTrafficSummary();
   process.exitCode = 1;
+}).finally(() => {
+  // Bersihkan file PAC sementara
+  for (const p of tempPacFiles) {
+    try { fs.unlinkSync(p); } catch {}
+  }
 });
+
