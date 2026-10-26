@@ -628,29 +628,8 @@ async function openNetMirrorPage(puppeteer, origin) {
         try {
           const adPage = await target.page();
           if (!adPage) return;
-          // Inject stealth script SEBELUM halaman diload agar Cloudflare Turnstile
-          // pada userver.net52.cc tidak mendeteksi fingerprint headless Chromium.
-          await adPage.evaluateOnNewDocument(() => {
-            // Hapus penanda webdriver yang paling sering dideteksi Turnstile
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            // Tambahkan bahasa Indonesia agar cocok dengan proxy Indonesia
-            Object.defineProperty(navigator, 'languages', { get: () => ['id-ID', 'id', 'en-US', 'en'] });
-            Object.defineProperty(navigator, 'language', { get: () => 'id-ID' });
-            // Samarkan plugins agar terlihat seperti browser nyata
-            Object.defineProperty(navigator, 'plugins', {
-              get: () => {
-                const arr = [{ name: 'Chrome PDF Plugin' }, { name: 'Chrome PDF Viewer' }, { name: 'Native Client' }];
-                arr.item = (i) => arr[i];
-                arr.namedItem = (n) => arr.find(p => p.name === n) || null;
-                arr.refresh = () => {};
-                return arr;
-              }
-            });
-            // Hapus __puppeteer_ / automation flags jika ada
-            delete window.__puppeteer_evaluation_script__;
-          }).catch(() => {});
+          if (proxy.auth) await adPage.authenticate(proxy.auth).catch(() => {});
           await attachTrafficMeter(adPage, 'ad-popup');
-          if (proxy.auth) await adPage.authenticate(proxy.auth);
           await configureDesktopPage(adPage, desktopProfile);
         } catch (e) {}
       });
