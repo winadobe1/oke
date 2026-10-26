@@ -53,7 +53,8 @@ const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 const IS_TEST_ONLY = process.argv.includes('--test-only');
 const IS_NO_PROXY = process.argv.includes('--no-proxy');
 const IS_TRAFFIC_MEASURE = process.argv.includes('--measure-traffic');
-const IS_FULL_PROXY = process.argv.includes('--full-proxy') || process.env.FULL_PROXY === '1';
+const IS_SELECTIVE_PROXY = process.argv.includes('--pac') || process.argv.includes('--selective-proxy') || process.env.SELECTIVE_PROXY === '1';
+const IS_FULL_PROXY = !IS_SELECTIVE_PROXY;
 const IS_HEADED_DESKTOP = process.env.HEADED_BROWSER === '1' || (Boolean(process.env.DISPLAY) && process.platform === 'linux');
 
 // Konfigurasi Residential Proxy Rainproxy Jakarta
@@ -244,9 +245,7 @@ function createDesktopBrowserProfile(executablePath) {
     }
   }
   const chromeMajor = chromeVersion.split('.')[0];
-  const platformToken = process.platform === 'win32'
-    ? 'Windows NT 10.0; Win64; x64'
-    : 'X11; Linux x86_64';
+  const platformToken = 'Windows NT 10.0; Win64; x64';
   // NetMirror sengaja mengembalikan 404 untuk /mobile/* jika suffix aplikasi
   // tidak ada. Ini tetap UA desktop; suffix hanya menandai klien Wins TV.
   const userAgent = `Mozilla/5.0 (${platformToken}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion} Safari/537.36 /OS.Gatu v3.1`;
@@ -552,6 +551,9 @@ async function openNetMirrorPage(puppeteer, origin) {
         '--password-store=basic',
         '--use-mock-keychain',
         '--export-tagged-pdf',
+        // Anti-Leak: blokir kebocoran IP lokal/VPN/CI lewat WebRTC UDP STUN
+        '--enforce-webrtc-ip-permission-check',
+        '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
       ],
       ignoreDefaultArgs: ['--enable-automation'],
     };
@@ -599,11 +601,18 @@ async function openNetMirrorPage(puppeteer, origin) {
           // Inject stealth script SEBELUM halaman diload agar Cloudflare Turnstile
           // pada userver.net52.cc tidak mendeteksi fingerprint headless Chromium.
           await adPage.evaluateOnNewDocument(() => {
+            // Blokir WebRTC API agar STUN request tidak membocorkan IP lokal/VPN
+            try {
+              delete window.RTCPeerConnection;
+              delete window.webkitRTCPeerConnection;
+              delete window.RTCSessionDescription;
+              delete window.RTCIceCandidate;
+            } catch (e) {}
             // Hapus penanda webdriver yang paling sering dideteksi Turnstile
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            // Tambahkan bahasa Indonesia agar cocok dengan proxy Indonesia
             Object.defineProperty(navigator, 'languages', { get: () => ['id-ID', 'id', 'en-US', 'en'] });
             Object.defineProperty(navigator, 'language', { get: () => 'id-ID' });
+            Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
             // Samarkan plugins agar terlihat seperti browser nyata
             Object.defineProperty(navigator, 'plugins', {
               get: () => {
@@ -623,12 +632,18 @@ async function openNetMirrorPage(puppeteer, origin) {
         } catch (e) {}
       });
 
-      // Stealth: hapus fingerprint headless dari halaman utama juga,
-      // agar Cloudflare tidak memblokir saat load net52.cc.
+      // Stealth: hapus fingerprint headless & WebRTC leak dari halaman utama juga
       await page.evaluateOnNewDocument(() => {
+        try {
+          delete window.RTCPeerConnection;
+          delete window.webkitRTCPeerConnection;
+          delete window.RTCSessionDescription;
+          delete window.RTCIceCandidate;
+        } catch (e) {}
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         Object.defineProperty(navigator, 'languages', { get: () => ['id-ID', 'id', 'en-US', 'en'] });
         Object.defineProperty(navigator, 'language', { get: () => 'id-ID' });
+        Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
       }).catch(() => {});
 
       // Kurangi koneksi paralel hanya selama dokumen awal dimuat. Interception
