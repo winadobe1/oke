@@ -15,6 +15,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const http = require('http');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 
@@ -53,7 +54,11 @@ const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 const IS_TEST_ONLY = process.argv.includes('--test-only');
 const IS_NO_PROXY = process.argv.includes('--no-proxy');
 const IS_TRAFFIC_MEASURE = process.argv.includes('--measure-traffic');
-const IS_FULL_PROXY = process.argv.includes('--full-proxy') || process.env.FULL_PROXY === '1';
+// Default ke Full Proxy agar seluruh koneksi browser (termasuk Cloudflare Turnstile & WebRTC)
+// 100% melewati Rainproxy Jakarta.
+// Mode PAC dihindari karena file PAC ditolak oleh Chrome dan menyebabkan fallback ke IP direct (kebocoran IP lokal/VPN/Azure DC).
+const IS_PAC_MODE = process.argv.includes('--pac');
+const IS_FULL_PROXY = !IS_PAC_MODE;
 const IS_HEADED_DESKTOP = process.env.HEADED_BROWSER === '1' || (Boolean(process.env.DISPLAY) && process.platform === 'linux');
 
 // Konfigurasi Residential Proxy Rainproxy Jakarta
@@ -89,7 +94,9 @@ function getHost(url) {
 }
 
 function isProxyRoutedHost(host) {
-  if (!activeProxyUrl || !activeProxyOriginHost || !host) return false;
+  if (!activeProxyUrl || !host) return false;
+  if (IS_FULL_PROXY) return true;
+  if (!activeProxyOriginHost) return false;
   return host === activeProxyOriginHost || host.endsWith(`.${activeProxyOriginHost}`);
 }
 
@@ -462,30 +469,54 @@ function describeNetMirrorIpMarker(addHash) {
   return 'ℹ️ FORMAT BARU/OPAQUE (server tidak mengirim marker tipe IP)';
 }
 
+let activePacServer = null;
+
 /**
- * Tulis PAC script ke temp file dan return URL file://.
- * Chrome 96+ membatasi data: URL untuk PAC scripts, sedangkan file:// selalu didukung.
- * PAC file ditulis sekali per browser session dan dibersihkan setelah browser ditutup.
+ * Buat PAC server lokal via HTTP (127.0.0.1).
+ * Chrome pada Linux/CI sering memblokir atau salah mem-parse file:// URL untuk PAC,
+ * yang menyebabkan Chromium diam-diam mengabaikan proxy dan connect langsung (DIRECT).
+ * HTTP server lokal di 127.0.0.1 dijamin 100% diterima oleh Chromium di Windows maupun Linux.
  */
-function writePacFile(proxyHost, origin) {
+function createPacServer(proxyHost, origin) {
+  if (activePacServer) {
+    try { activePacServer.close(); } catch (e) {}
+    activePacServer = null;
+  }
+
   const proxyEndpoint = new URL(proxyHost).host;
   const originHost = new URL(origin).hostname.toLowerCase();
   const pac = [
     'function FindProxyForURL(url, host) {',
     '  host = host.toLowerCase();',
-    `  if (host === ${JSON.stringify(originHost)} || shExpMatch(host, ${JSON.stringify(`*.${originHost}`)})) {`,
+    `  if (host === ${JSON.stringify(originHost)} || shExpMatch(host, ${JSON.stringify(`*.${originHost}`)}) || shExpMatch(host, "*.cloudflare.com") || shExpMatch(host, "*.challenges.cloudflare.com")) {`,
     `    return ${JSON.stringify(`PROXY ${proxyEndpoint}`)};`,
     '  }',
     '  return "DIRECT";',
     '}',
   ].join('\n');
 
-  const pacPath = path.join(os.tmpdir(), `nm-proxy-${crypto.randomBytes(4).toString('hex')}.pac`);
-  fs.writeFileSync(pacPath, pac, 'utf8');
-  tempPacFiles.push(pacPath);
-  // Pada Windows, path separator harus / untuk URL file://
-  const pacUrl = 'file:///' + pacPath.replace(/\\/g, '/');
-  return { pacUrl, pacPath };
+  try {
+    const server = http.createServer((req, res) => {
+      res.writeHead(200, {
+        'Content-Type': 'application/x-ns-proxy-autoconfig',
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.end(pac);
+    });
+
+    server.listen(0, '127.0.0.1');
+    const port = server.address().port;
+    activePacServer = server;
+    return { pacUrl: `http://127.0.0.1:${port}/proxy.pac` };
+  } catch (err) {
+    const pacPath = path.join(os.tmpdir(), `nm-proxy-${crypto.randomBytes(4).toString('hex')}.pac`);
+    fs.writeFileSync(pacPath, pac, 'utf8');
+    tempPacFiles.push(pacPath);
+    const pacUrl = process.platform === 'win32'
+      ? 'file:///' + pacPath.replace(/\\/g, '/')
+      : 'file://' + pacPath;
+    return { pacUrl };
+  }
 }
 
 function findSystemBrowser() {
@@ -562,10 +593,10 @@ async function openNetMirrorPage(puppeteer, origin) {
         launchOpts.args.push(`--proxy-server=${proxy.host}`);
         console.log(`   -> 🌐 Proxy: ${proxy.host} (Targeting: Indonesia/Jakarta) [Full]${sessionInfo}`);
       } else {
-        // Tulis PAC ke file:// agar Chrome 96+ tidak memblokir data: URL
-        const { pacUrl, pacPath } = writePacFile(proxy.host, origin);
+        const { pacUrl } = createPacServer(proxy.host, origin);
         launchOpts.args.push(`--proxy-pac-url=${pacUrl}`);
-        console.log(`   -> 🌐 Proxy: ${proxy.host} (Targeting: Indonesia/Jakarta) [PAC: ${path.basename(pacPath)}]${sessionInfo}`);
+        launchOpts.args.push('--allow-file-access-from-files');
+        console.log(`   -> 🌐 Proxy: ${proxy.host} (Targeting: Indonesia/Jakarta) [PAC: ${pacUrl}]${sessionInfo}`);
       }
     }
 
@@ -581,7 +612,8 @@ async function openNetMirrorPage(puppeteer, origin) {
 
     try {
       browser = await puppeteer.launch(launchOpts);
-      page = await browser.newPage();
+      const pages = await browser.pages();
+      page = pages.length > 0 ? pages[0] : await browser.newPage();
       await attachTrafficMeter(page, 'netmirror-main');
 
       if (proxy.auth) {
@@ -749,11 +781,14 @@ async function clickVerificationAd(page, browser, proxy, desktopProfile, initial
     throw new Error('Tombol verifikasi kehilangan area klik sebelum interaksi dilakukan.');
   }
 
-  // Gunakan pointer event nyata dari DevTools, bukan HTMLElement.click().
-  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 8 });
-  await page.mouse.down();
-  await new Promise(resolve => setTimeout(resolve, 180));
-  await page.mouse.up();
+  // Picu klik tombol iklan (.open-support)
+  await button.click().catch(() => {});
+  if (box) {
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 }).catch(() => {});
+    await page.mouse.down().catch(() => {});
+    await new Promise(resolve => setTimeout(resolve, 150));
+    await page.mouse.up().catch(() => {});
+  }
 
   const popupTarget = await popupTargetPromise;
   if (!popupTarget) {
@@ -862,7 +897,7 @@ async function harvestSessionAttempt(origin, sessionAttempt) {
       const adResult = await clickVerificationAd(page, browser, proxy, desktopProfile, initialHash);
       console.log(`   -> Tombol iklan ditekan${adResult.page ? ' dan popup berhasil dibuka' : ''}. Menunggu callback verifikasi...`);
 
-      const pollLimitSeconds = 24;
+      const pollLimitSeconds = 36;
 
       for (let sec = 2; sec <= pollLimitSeconds; sec += 2) {
         await new Promise(r => setTimeout(r, 2000));
@@ -969,7 +1004,7 @@ async function harvestSessionAttempt(origin, sessionAttempt) {
       try { return decodeURIComponent(val); } catch { return val; }
     }
 
-    const primaryToken = decodeCookieValue(tHashTCookie?.value) || decodeCookieValue(tHashCookie?.value);
+    let primaryToken = decodeCookieValue(tHashTCookie?.value) || decodeCookieValue(tHashCookie?.value);
 
     if (!primaryToken) {
       console.log('   Daftar cookie saat ini:', finalCookies.map(c => c.name).join(', '));
@@ -1225,6 +1260,9 @@ main().then(() => {
   printTrafficSummary();
   process.exitCode = 1;
 }).finally(() => {
+  if (activePacServer) {
+    try { activePacServer.close(); } catch {}
+  }
   // Bersihkan file PAC sementara
   for (const p of tempPacFiles) {
     try { fs.unlinkSync(p); } catch {}
