@@ -622,7 +622,7 @@ async function openNetMirrorPage(puppeteer, origin) {
 
       await configureDesktopPage(page, desktopProfile);
 
-      // Popup iklan tidak diblokir agar request callback/tracking tetap berjalan.
+      // Popup iklan dimonitor dan dihemat kuotanya dengan memblokir gambar/media/font
       browser.on('targetcreated', async (target) => {
         if (target.type() !== 'page') return;
         try {
@@ -631,6 +631,17 @@ async function openNetMirrorPage(puppeteer, origin) {
           if (proxy.auth) await adPage.authenticate(proxy.auth).catch(() => {});
           await attachTrafficMeter(adPage, 'ad-popup');
           await configureDesktopPage(adPage, desktopProfile);
+
+          // Hemat kuota proxy: blokir aset berat (gambar, video, font) pada popup iklan
+          await adPage.setRequestInterception(true).catch(() => {});
+          adPage.on('request', (req) => {
+            const rt = req.resourceType();
+            if (['image', 'media', 'font'].includes(rt)) {
+              req.abort('blockedbyclient').catch(() => {});
+            } else {
+              req.continue().catch(() => {});
+            }
+          });
         } catch (e) {}
       });
 
@@ -927,9 +938,14 @@ async function harvestSessionAttempt(origin, sessionAttempt) {
           console.log(`\n   🎉 VERIFIKASI BERHASIL pada percobaan iklan ${adAttempt}!`);
           isAllDone = true;
 
+          // Tutup popup iklan SEGERA agar tidak terus menyedot kuota proxy di background
+          if (adResult.page && !adResult.page.isClosed()) {
+            await adResult.page.close().catch(() => {});
+          }
+
           if (!navReloadDetected) {
             console.log('   -> Me-reload halaman untuk finalisasi cookie...');
-            await page.reload({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
           }
 
           console.log('   -> Memanggil p.php untuk sinkronisasi token...');
