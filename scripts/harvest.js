@@ -175,7 +175,16 @@ function createProxyConfig(rawProxy) {
   }
 
   try {
-    const pUrl = new URL(rawProxy);
+    let normalized = String(rawProxy).trim();
+    // Sanitasi otomatis parameter Rainproxy: koreksi state-jakarta_raya & pastikan zip-12850 (Residential MyRepublic)
+    if (/rainproxy\.io/i.test(normalized)) {
+      normalized = normalized.replace(/state-jakarta_raya/gi, 'state-jakarta');
+      if (normalized.includes('state-jakarta') && !normalized.includes('zip-12850')) {
+        normalized = normalized.replace(/state-jakarta-city-jakarta/gi, 'state-jakarta-city-jakarta-zip-12850');
+      }
+    }
+
+    const pUrl = new URL(normalized);
     let username = decodeURIComponent(pUrl.username || '');
     let sessionId = null;
 
