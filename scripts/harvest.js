@@ -54,13 +54,13 @@ const IS_TEST_ONLY = process.argv.includes('--test-only');
 const IS_NO_PROXY = process.argv.includes('--no-proxy');
 const IS_TRAFFIC_MEASURE = process.argv.includes('--measure-traffic');
 const IS_FULL_PROXY = process.argv.includes('--full-proxy') || process.env.FULL_PROXY === '1';
-const IS_HEADED_DESKTOP = process.env.HEADED_BROWSER === '1';
+const IS_HEADED_DESKTOP = process.env.HEADED_BROWSER === '1' || (Boolean(process.env.DISPLAY) && process.platform === 'linux');
 
-// Konfigurasi Residential Proxy. Simpan kredensial di environment/secret,
-// jangan di source code atau workflow.
+// Konfigurasi Residential Proxy Rainproxy Jakarta
+const DEFAULT_PROXY = 'http://uy9rgc3e3tb-country-ID-state-jakarta-city-jakarta-zip-12850:p7c3vz7ey9tz@resi-bridge-us.rainproxy.io:3333';
 const CONFIGURED_PROXY = IS_NO_PROXY
   ? null
-  : process.env.PROXY_SERVER || process.env.RESIDENTIAL_PROXY || 'http://uy9rgc3e3tb-country-ID-state-jakarta_raya-city-jakarta-session-bpu5qzx6:p7c3vz7ey9tz@resi-bridge-us.rainproxy.io:3333';
+  : process.env.PROXY_SERVER || process.env.RESIDENTIAL_PROXY || DEFAULT_PROXY;
 let activeProxyUrl = CONFIGURED_PROXY;
 let activeProxyOriginHost = null;
 
